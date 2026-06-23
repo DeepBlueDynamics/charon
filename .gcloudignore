@@ -1,0 +1,3 @@
+# Keep the Cloud Build upload small; the image compiles from source.
+.git/
+target/
