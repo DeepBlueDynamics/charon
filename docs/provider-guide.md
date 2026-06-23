@@ -65,6 +65,20 @@ context_length = 4096
 price_msat_per_mtok_in = 200000
 # Price per 1M output tokens in millisats
 price_msat_per_mtok_out = 600000
+
+[[models]]
+# Public name requested by consumers
+name = "gpt-4o"
+# Use a generic OpenAI-compatible backend (like a LiteLLM proxy)
+backend = "openai"
+base_url = "http://localhost:4000/v1"
+# Environment variable holding the api_key (never inline the secret)
+api_key_env = "LITELLM_API_KEY"
+# Upstream model name (openai_model / litellm_model rewrite)
+openai_model = "openai/gpt-4o"
+context_length = 8192
+price_msat_per_mtok_in = 500000
+price_msat_per_mtok_out = 1500000
 ```
 
 ### Configuration fields reference
@@ -79,10 +93,17 @@ price_msat_per_mtok_out = 600000
 | `[wallet]` | `receive_address` | `String` | No | Destination for payouts. Defaults to `dev`. |
 | `[ollama]` | `base_url` | `String` | No | Ollama URL. Overridden by CLI or env. |
 | `[[models]]` | `name` | `String` | Yes | Model identifier advertised to the gateway. |
-| `[[models]]` | `ollama_model` | `String` | No | Actual local Ollama model identifier. Defaults to `name`. |
+| `[[models]]` | `backend` | `String` | No | Backend type (`ollama` or `openai`). Defaults to `ollama`. |
+| `[[models]]` | `base_url` | `String` | No | Base URL override for this specific model (e.g. `http://localhost:4000/v1`). |
+| `[[models]]` | `api_key_env` | `String` | No | Name of the environment variable holding the authorization API key. |
+| `[[models]]` | `ollama_model` | `String` | No | Actual local Ollama model identifier (for `ollama` backend). |
+| `[[models]]` | `openai_model` | `String` | No | Upstream OpenAI/LiteLLM model identifier to rewrite to (for `openai` backend). |
+| `[[models]]` | `litellm_model` | `String` | No | Alias for `openai_model` (for `openai` backend). |
 | `[[models]]` | `context_length` | `u32` | No | Allowed context length. Defaults to `4096`. |
 | `[[models]]` | `price_msat_per_mtok_in` | `u64` | No | Cost per 1,000,000 input tokens. Defaults to `0`. |
 | `[[models]]` | `price_msat_per_mtok_out` | `u64` | No | Cost per 1,000,000 output tokens. Defaults to `0`. |
+
+**Note:** Any model fronted by LiteLLM or an OpenAI-compatible gateway can be served by configuring `backend = "openai"` alongside its upstream model rewrite name and environment key mapping.
 
 ## CLI flags and environment variables
 

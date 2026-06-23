@@ -149,13 +149,38 @@ struct ProviderOllamaConfig {
 #[derive(Debug, Clone, Deserialize)]
 struct ProviderModelConfig {
     name: String,
+    #[serde(default = "default_backend_name")]
+    backend: String,
+    base_url: Option<String>,
+    api_key_env: Option<String>,
     ollama_model: Option<String>,
+    openai_model: Option<String>,
+    litellm_model: Option<String>,
     #[serde(default = "default_context_length")]
     context_length: u32,
     #[serde(default)]
     price_msat_per_mtok_in: u64,
     #[serde(default)]
     price_msat_per_mtok_out: u64,
+}
+
+fn default_backend_name() -> String {
+    "ollama".to_string()
+}
+
+impl ProviderModelConfig {
+    fn rewritten_model_name(&self) -> String {
+        if self.backend == "openai" {
+            self.openai_model
+                .clone()
+                .or_else(|| self.litellm_model.clone())
+                .unwrap_or_else(|| self.name.clone())
+        } else {
+            self.ollama_model
+                .clone()
+                .unwrap_or_else(|| self.name.clone())
+        }
+    }
 }
 
 struct ProviderRuntime {
@@ -217,6 +242,8 @@ async fn run_provider(
         "charon provider connecting"
     );
 
+    verify_ollama_models(&runtime.ollama_base_url, &runtime.models).await;
+
     let (mut ws, _) = connect_async(gateway_url_with_token(&runtime.gateway, Some(&runtime.ahp_token))).await?;
     send_frame(
         &mut ws,
@@ -228,7 +255,7 @@ async fn run_provider(
                 .values()
                 .map(|model| ModelCard {
                     name: model.name.clone(),
-                    backend: "ollama".to_string(),
+                    backend: model.backend.clone(),
                     context_length: model.context_length,
                     price_msat_per_mtok_in: model.price_msat_per_mtok_in,
                     price_msat_per_mtok_out: model.price_msat_per_mtok_out,
@@ -514,9 +541,21 @@ where
     let Some(model_config) = runtime.models.get(&provider_session.envelope.model) else {
         return Ok(());
     };
-    request["model"] = Value::String(model_config.ollama_model.clone().unwrap_or_else(|| model_config.name.clone()));
+    request["model"] = Value::String(model_config.rewritten_model_name());
 
-    let response_chunks = ollama_or_canned(&runtime.ollama_base_url, request).await;
+    let base_url = model_config.base_url.clone().unwrap_or_else(|| {
+        if model_config.backend == "openai" {
+            "http://localhost:4000/v1".to_string()
+        } else {
+            runtime.ollama_base_url.clone()
+        }
+    });
+
+    let api_key = model_config.api_key_env.as_ref().and_then(|env_name| {
+        std::env::var(env_name).ok()
+    });
+
+    let response_chunks = upstream_or_canned(&base_url, api_key, request).await;
     let head = session.seal(br#"{"status":200,"content_type":"text/event-stream"}"#)?;
     send_frame(ws, &Frame::ResHead { session_id: session_id.clone(), blob: encode_blob(&head) }).await?;
     let mut completion_tokens = 0;
@@ -537,10 +576,21 @@ where
     Ok(())
 }
 
-async fn ollama_or_canned(base_url: &str, request: Value) -> Vec<String> {
+async fn upstream_or_canned(base_url: &str, api_key: Option<String>, request: Value) -> Vec<String> {
     let client = reqwest::Client::new();
-    let url = format!("{}/v1/chat/completions", base_url.trim_end_matches('/'));
-    match client.post(url).json(&request).send().await {
+    let base = base_url.trim_end_matches('/');
+    let url = if base.ends_with("/v1") {
+        format!("{}/chat/completions", base)
+    } else {
+        format!("{}/v1/chat/completions", base)
+    };
+
+    let mut req_builder = client.post(url).json(&request);
+    if let Some(key) = api_key {
+        req_builder = req_builder.header("Authorization", format!("Bearer {key}"));
+    }
+
+    match req_builder.send().await {
         Ok(response) if response.status().is_success() => {
             if request.get("stream").and_then(Value::as_bool).unwrap_or(false) {
                 let mut chunks = Vec::new();
@@ -549,8 +599,8 @@ async fn ollama_or_canned(base_url: &str, request: Value) -> Vec<String> {
                     match next {
                         Ok(bytes) => chunks.push(String::from_utf8_lossy(&bytes).to_string()),
                         Err(err) => {
-                            tracing::warn!(error = ?err, "ollama stream failed; switching to canned tail");
-                            chunks.push(canned_sse_chunk("ollama stream failed"));
+                            tracing::warn!(error = ?err, "upstream stream failed; switching to canned tail");
+                            chunks.push(canned_sse_chunk("upstream stream failed"));
                             break;
                         }
                     }
@@ -563,10 +613,10 @@ async fn ollama_or_canned(base_url: &str, request: Value) -> Vec<String> {
             }
         }
         Ok(response) => {
-            tracing::warn!(status = %response.status(), "ollama returned non-success; using canned response");
+            tracing::warn!(status = %response.status(), "upstream returned non-success; using canned response");
         }
         Err(err) => {
-            tracing::warn!(error = ?err, "ollama unreachable; using canned response");
+            tracing::warn!(error = ?err, "upstream unreachable; using canned response");
         }
     }
 
@@ -635,6 +685,51 @@ fn load_consumer_models() -> anyhow::Result<Vec<ModelConfig>> {
             })
         })
         .collect())
+}
+
+/// Verify ollama-backed models actually exist in the local Ollama at startup
+/// (spec 06). Warns — does not abort — so the provider still comes up, but the
+/// operator immediately sees which advertised models can't really be served.
+async fn verify_ollama_models(base_url: &str, models: &HashMap<String, ProviderModelConfig>) {
+    let ollama: Vec<&ProviderModelConfig> = models.values().filter(|m| m.backend != "openai").collect();
+    if ollama.is_empty() {
+        return;
+    }
+    let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+    let available: Option<Vec<String>> = async {
+        let resp = reqwest::Client::new().get(&url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let json: serde_json::Value = resp.json().await.ok()?;
+        Some(
+            json.get("models")?
+                .as_array()?
+                .iter()
+                .filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(str::to_string))
+                .collect(),
+        )
+    }
+    .await;
+    match available {
+        None => tracing::warn!(
+            %url,
+            "could not reach Ollama to verify models; advertised models will serve a fallback reply until Ollama is reachable"
+        ),
+        Some(tags) => {
+            for m in ollama {
+                let want = m.rewritten_model_name();
+                if tags.iter().any(|t| t == &want) {
+                    tracing::info!(model = %m.name, ollama = %want, "model available in Ollama");
+                } else {
+                    tracing::warn!(
+                        model = %m.name, ollama = %want, available = ?tags,
+                        "model NOT in Ollama — it will be advertised but serve a fallback until you `ollama pull` it"
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn load_provider_runtime(
