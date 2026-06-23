@@ -1,0 +1,14 @@
+# Build + push the Charon gateway image. $PROJECT_ID is a Cloud Build built-in
+# substitution (the active project) — no project id is hardcoded here.
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.gateway'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/charon-gateway:latest'
+      - '.'
+images:
+  - 'gcr.io/$PROJECT_ID/charon-gateway:latest'
+timeout: '1800s'
