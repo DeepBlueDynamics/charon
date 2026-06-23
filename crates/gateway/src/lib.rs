@@ -115,12 +115,28 @@ pub struct ConnectionInfo {
     pub ip: IpAddr,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WalletEntry {
+    pub ts: u64,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub amount_msat: i64,
+    pub status: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct UserWallet {
+    pub balance_msat: u64,
+    pub history: Vec<WalletEntry>,
+}
+
 pub struct GatewayState {
     pub providers: Mutex<HashMap<String, ProviderConnection>>,
     pub sessions: Mutex<HashMap<String, SessionInfo>>,
     pub principal_sessions: Mutex<HashMap<String, HashSet<String>>>,
     pub connections: Mutex<HashMap<Uuid, ConnectionInfo>>,
     pub rate_limits: Mutex<HashMap<String, Vec<tokio::time::Instant>>>,
+    pub wallets: Mutex<HashMap<String, UserWallet>>,
     pub authenticator: Arc<dyn Authenticator>,
     pub payment_verifier: Arc<dyn PaymentVerifier>,
     pub disable_auth: bool,
@@ -142,12 +158,43 @@ impl GatewayState {
             principal_sessions: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
             rate_limits: Mutex::new(HashMap::new()),
+            wallets: Mutex::new(HashMap::new()),
             authenticator,
             payment_verifier,
             disable_auth,
             markup_bps,
             floor_msat,
         }
+    }
+
+    pub fn record_wallet_event(&self, principal: &str, kind: &str, amount_msat: i64, status: &str) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let entry = WalletEntry {
+            ts,
+            r#type: kind.to_string(),
+            amount_msat,
+            status: status.to_string(),
+        };
+
+        let mut wallets = self.wallets.lock().unwrap();
+        let wallet = wallets.entry(principal.to_string()).or_insert_with(|| UserWallet {
+            balance_msat: 10_000_000_000,
+            history: Vec::new(),
+        });
+
+        if amount_msat >= 0 {
+            wallet.balance_msat = wallet.balance_msat.saturating_add(amount_msat as u64);
+        } else {
+            let amount_abs = amount_msat.unsigned_abs();
+            wallet.balance_msat = wallet.balance_msat.saturating_sub(amount_abs);
+        }
+
+        wallet.history.push(entry);
     }
 
     pub fn check_ip_connect_rate_limit(&self, ip: IpAddr) -> bool {
@@ -444,10 +491,52 @@ pub async fn wallet_deposit(
     (StatusCode::NOT_IMPLEMENTED, "TODO: POST /v1/wallet/deposit (spec 12)")
 }
 
+#[derive(serde::Serialize)]
+pub struct BalanceResponse {
+    pub balance_msat: u64,
+}
+
 pub async fn wallet_balance(
-    _principal: HttpPrincipal,
-) -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "TODO: GET /v1/wallet/balance (spec 12)")
+    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
+    principal: HttpPrincipal,
+) -> axum::Json<BalanceResponse> {
+    let mut wallets = state.wallets.lock().unwrap();
+    let wallet = wallets.entry(principal.0.clone()).or_insert_with(|| UserWallet {
+        balance_msat: 10_000_000_000,
+        history: Vec::new(),
+    });
+    axum::Json(BalanceResponse {
+        balance_msat: wallet.balance_msat,
+    })
+}
+
+#[derive(serde::Serialize)]
+pub struct HistoryResponse {
+    pub entries: Vec<WalletEntry>,
+}
+
+pub async fn wallet_history(
+    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
+    principal: HttpPrincipal,
+) -> axum::Json<HistoryResponse> {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let cutoff = now.saturating_sub(14 * 24 * 60 * 60);
+
+    let mut wallets = state.wallets.lock().unwrap();
+    let wallet = wallets.entry(principal.0.clone()).or_insert_with(|| UserWallet {
+        balance_msat: 10_000_000_000,
+        history: Vec::new(),
+    });
+
+    wallet.history.retain(|e| e.ts >= cutoff);
+
+    axum::Json(HistoryResponse {
+        entries: wallet.history.clone(),
+    })
 }
 
 pub async fn post_ratings(
@@ -887,6 +976,9 @@ async fn process_frame(
             if let Some(ref cc) = consumer_conn {
                 let _ = cc.sender.send(settled_frame);
             }
+
+            state.record_wallet_event(&session.consumer_principal, "settlement", -(session.total_msat as i64), "settled");
+            state.record_wallet_event(&session.provider_principal, "settlement", session.provider_msat as i64, "settled");
             
             state.remove_session(&session_id);
             Ok(())
@@ -1028,6 +1120,7 @@ pub async fn run_server(
         .route("/quote", post(post_quote))
         .route("/wallet/deposit", post(wallet_deposit))
         .route("/wallet/balance", get(wallet_balance))
+        .route("/wallet/history", get(wallet_history))
         .route("/ratings", post(post_ratings))
         .layer(cors_layer);
 

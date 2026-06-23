@@ -427,4 +427,139 @@ async fn test_cors_preflight_and_origins() {
     std::env::remove_var("CHARON_CORS_ORIGINS");
 }
 
+#[tokio::test]
+async fn test_wallet_history_retention_and_isolation() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    struct MockAuthenticator;
+    impl charon_gateway::Authenticator for MockAuthenticator {
+        fn authenticate<'a>(
+            &'a self,
+            token: &'a str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ErrorCode>> + Send + 'a>> {
+            Box::pin(async move {
+                match token {
+                    "token_a" => Ok("consumer_a".to_string()),
+                    "token_b" => Ok("consumer_b".to_string()),
+                    _ => Err(ErrorCode::AuthFailed),
+                }
+            })
+        }
+    }
+
+    let authenticator = Arc::new(MockAuthenticator);
+    let payment_verifier = Arc::new(DevPaymentVerifier);
+    let state = Arc::new(GatewayState::new(
+        authenticator,
+        payment_verifier,
+        false, // disable_auth = false (so it checks Bearer token)
+        1000,
+        21000,
+    ));
+
+    // Populate wallet histories
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let old_ts = now.saturating_sub(15 * 24 * 60 * 60); // 15 days ago (older than 14 days)
+    let new_ts = now.saturating_sub(5 * 24 * 60 * 60);  // 5 days ago (newer than 14 days)
+
+    {
+        let mut wallets = state.wallets.lock().unwrap();
+        
+        // consumer_a: has one new entry and one old entry
+        let wallet_a = wallets.entry("consumer_a".to_string()).or_default();
+        wallet_a.balance_msat = 10_000_000_000;
+        wallet_a.history.push(charon_gateway::WalletEntry {
+            ts: old_ts,
+            r#type: "settlement".to_string(),
+            amount_msat: -5000,
+            status: "settled".to_string(),
+        });
+        wallet_a.history.push(charon_gateway::WalletEntry {
+            ts: new_ts,
+            r#type: "settlement".to_string(),
+            amount_msat: -2000,
+            status: "settled".to_string(),
+        });
+
+        // consumer_b: has one entry at current timestamp
+        let wallet_b = wallets.entry("consumer_b".to_string()).or_default();
+        wallet_b.balance_msat = 5_000_000_000;
+        wallet_b.history.push(charon_gateway::WalletEntry {
+            ts: now,
+            r#type: "settlement".to_string(),
+            amount_msat: -1000,
+            status: "settled".to_string(),
+        });
+    }
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        run_server(state_clone, listener).await.unwrap();
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+
+    // 1. Check isolation: consumer_a should not see consumer_b's entries, and old entries are excluded
+    let url_history = format!("http://127.0.0.1:{}/v1/wallet/history", port);
+    
+    let res_a = client.get(&url_history)
+        .header("Authorization", "Bearer token_a")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_a.status(), reqwest::StatusCode::OK);
+    
+    let body_a: serde_json::Value = res_a.json().await.unwrap();
+    let entries_a = body_a.get("entries").unwrap().as_array().unwrap();
+    
+    // Check retention: only the entry older than 14 days is excluded (1 remaining)
+    assert_eq!(entries_a.len(), 1);
+    let entry_a = &entries_a[0];
+    assert_eq!(entry_a.get("ts").unwrap().as_u64().unwrap(), new_ts);
+    assert_eq!(entry_a.get("amount_msat").unwrap().as_i64().unwrap(), -2000);
+    assert_eq!(entry_a.get("type").unwrap().as_str().unwrap(), "settlement");
+
+    // 2. Check consumer_b's history isolation
+    let res_b = client.get(&url_history)
+        .header("Authorization", "Bearer token_b")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_b.status(), reqwest::StatusCode::OK);
+    
+    let body_b: serde_json::Value = res_b.json().await.unwrap();
+    let entries_b = body_b.get("entries").unwrap().as_array().unwrap();
+    
+    // consumer_b has exactly 1 entry
+    assert_eq!(entries_b.len(), 1);
+    let entry_b = &entries_b[0];
+    assert_eq!(entry_b.get("ts").unwrap().as_u64().unwrap(), now);
+    assert_eq!(entry_b.get("amount_msat").unwrap().as_i64().unwrap(), -1000);
+
+    // 3. Verify balance isolation
+    let url_balance = format!("http://127.0.0.1:{}/v1/wallet/balance", port);
+    
+    let bal_res_a = client.get(&url_balance)
+        .header("Authorization", "Bearer token_a")
+        .send()
+        .await
+        .unwrap();
+    let bal_a: serde_json::Value = bal_res_a.json().await.unwrap();
+    assert_eq!(bal_a.get("balance_msat").unwrap().as_u64().unwrap(), 10_000_000_000);
+
+    let bal_res_b = client.get(&url_balance)
+        .header("Authorization", "Bearer token_b")
+        .send()
+        .await
+        .unwrap();
+    let bal_b: serde_json::Value = bal_res_b.json().await.unwrap();
+    assert_eq!(bal_b.get("balance_msat").unwrap().as_u64().unwrap(), 5_000_000_000);
+}
+
+
 
