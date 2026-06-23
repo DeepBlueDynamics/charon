@@ -1,0 +1,6 @@
+# Normalize line endings: LF in the repo and working tree (Linux container
+# agents and the Windows host share this bind-mounted tree).
+* text=auto eol=lf
+*.png binary
+*.jpg binary
+*.zip binary
