@@ -24,6 +24,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+use x25519_dalek::{PublicKey, StaticSecret};
 
 #[derive(Debug, Error)]
 pub enum CryptoError {
@@ -226,6 +227,11 @@ pub fn responder_handshake(
             .build_responder()
             .map_err(|err| CryptoError::Handshake(err.to_string()))?,
     })
+}
+
+pub fn public_from_private(private: &[u8; 32]) -> [u8; 32] {
+    let secret = StaticSecret::from(*private);
+    *PublicKey::from(&secret).as_bytes()
 }
 
 fn push_len_prefixed(out: &mut Vec<u8>, value: &[u8]) {

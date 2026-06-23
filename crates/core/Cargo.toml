@@ -16,3 +16,4 @@ tokio.workspace = true
 tracing.workspace = true
 snow.workspace = true
 blake2.workspace = true
+x25519-dalek.workspace = true
