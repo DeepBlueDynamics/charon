@@ -360,3 +360,71 @@ async fn test_non_dev_mode_consumer_verification() {
     }
 }
 
+#[tokio::test]
+async fn test_cors_preflight_and_origins() {
+    // Set custom CORS origins env var for testing
+    std::env::set_var("CHARON_CORS_ORIGINS", "https://test-dashboard.charon.nuts.services,http://localhost:12345");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let port = addr.port();
+
+    let authenticator = Arc::new(GnosisAuthenticator::new("".to_string(), true));
+    let payment_verifier = Arc::new(DevPaymentVerifier);
+    let state = Arc::new(GatewayState::new(
+        authenticator,
+        payment_verifier,
+        true, // disable_auth
+        1000,
+        21000,
+    ));
+
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        run_server(state_clone, listener).await.unwrap();
+    });
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    let client = reqwest::Client::new();
+
+    // 1. Send OPTIONS preflight request to /v1/directory from an allowed origin
+    let preflight_url = format!("http://127.0.0.1:{}/v1/directory", port);
+    let res = client.request(reqwest::Method::OPTIONS, &preflight_url)
+        .header("Origin", "https://test-dashboard.charon.nuts.services")
+        .header("Access-Control-Request-Method", "GET")
+        .header("Access-Control-Request-Headers", "authorization, content-type")
+        .send()
+        .await
+        .unwrap();
+
+    assert!(res.status().is_success());
+
+    // Verify CORS response headers
+    let cors_origin = res.headers().get("access-control-allow-origin").unwrap().to_str().unwrap();
+    assert_eq!(cors_origin, "https://test-dashboard.charon.nuts.services");
+
+    let cors_methods = res.headers().get("access-control-allow-methods").unwrap().to_str().unwrap();
+    assert!(cors_methods.contains("GET"));
+    assert!(cors_methods.contains("POST"));
+    assert!(cors_methods.contains("OPTIONS"));
+
+    let cors_headers = res.headers().get("access-control-allow-headers").unwrap().to_str().unwrap();
+    assert!(cors_headers.to_lowercase().contains("authorization"));
+    assert!(cors_headers.to_lowercase().contains("content-type"));
+
+    // 2. Try OPTIONS request from a disallowed origin
+    let res_disallowed = client.request(reqwest::Method::OPTIONS, &preflight_url)
+        .header("Origin", "https://evil.com")
+        .header("Access-Control-Request-Method", "GET")
+        .send()
+        .await
+        .unwrap();
+
+    assert!(res_disallowed.headers().get("access-control-allow-origin").is_none());
+
+    // Clean up env
+    std::env::remove_var("CHARON_CORS_ORIGINS");
+}
+
+

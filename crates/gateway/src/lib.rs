@@ -1000,14 +1000,40 @@ pub async fn run_server(
     state: Arc<GatewayState>,
     listener: TcpListener,
 ) -> anyhow::Result<()> {
+    use axum::http::{HeaderValue, Method, header::{AUTHORIZATION, CONTENT_TYPE}};
+    use tower_http::cors::CorsLayer;
+
+    let origins_str = std::env::var("CHARON_CORS_ORIGINS").unwrap_or_else(|_| {
+        "https://dashboard.charon.nuts.services,http://localhost:5173,http://localhost:3000".to_string()
+    });
+
+    let mut allowed_origins = Vec::new();
+    for origin in origins_str.split(',') {
+        let trimmed = origin.trim();
+        if !trimmed.is_empty() {
+            if let Ok(val) = trimmed.parse::<HeaderValue>() {
+                allowed_origins.push(val);
+            }
+        }
+    }
+
+    let cors_layer = CorsLayer::new()
+        .allow_origin(allowed_origins)
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE]);
+
+    let v1_router = Router::new()
+        .route("/directory", get(get_directory))
+        .route("/providers/{principal}/reputation", get(get_reputation))
+        .route("/quote", post(post_quote))
+        .route("/wallet/deposit", post(wallet_deposit))
+        .route("/wallet/balance", get(wallet_balance))
+        .route("/ratings", post(post_ratings))
+        .layer(cors_layer);
+
     let app = Router::new()
         .route("/ws", get(ws_handler))
-        .route("/v1/directory", get(get_directory))
-        .route("/v1/providers/{principal}/reputation", get(get_reputation))
-        .route("/v1/quote", post(post_quote))
-        .route("/v1/wallet/deposit", post(wallet_deposit))
-        .route("/v1/wallet/balance", get(wallet_balance))
-        .route("/v1/ratings", post(post_ratings))
+        .nest("/v1", v1_router)
         .with_state(state)
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
 

@@ -27,3 +27,7 @@ tracing-subscriber.workspace = true
 uuid.workspace = true
 clap.workspace = true
 axum = { workspace = true, features = ["ws"] }
+tower-http = { workspace = true }
+
+[dev-dependencies]
+reqwest = { workspace = true }
