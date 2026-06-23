@@ -31,6 +31,7 @@ prompt or a reply.
 | 10 | [security-threat-model](./10-security-threat-model.md) | Threats, mitigations, residual risk |
 | 11 | [deployment](./11-deployment.md) | Container roster, Cloud Run (nuts.services), auth wiring |
 | 12 | [ui-dashboard](./12-ui-dashboard.md) | Web UI: NUTS login, provider ads, payments; gateway HTTP API |
+| 13 | [mcp](./13-mcp.md) | MCP server: buy inference as tools; 402 pay-required with ASCII-QR invoice |
 
 ## Conventions
 

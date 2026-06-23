@@ -7,8 +7,8 @@ central gateway authenticates both sides with NUTS tokens, matches them, relays
 opaque ciphertext, settles payment, and takes a fee — without ever seeing a
 prompt or a reply.
 
-Charon is the ferryman: it carries traffic across, gets paid, and learns
-nothing about its passengers.
+Charon is the ferryman: it carries traffic across, gets paid, and never sees a
+byte of the cargo.
 
 - **Client** (`charon`) — one container, two roles. `charon consumer` exposes a
   plain OpenAI-compatible API locally and does all the marketplace work behind
