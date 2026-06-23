@@ -16,6 +16,12 @@ pub type Blob = String;
 pub struct Envelope {
     /// Target provider principal (NUTS identity / email).
     pub provider: String,
+    /// The consumer's own NUTS principal. The gateway MUST verify this equals
+    /// the authenticated consumer on the session (except in dev `DISABLE_AUTH`).
+    /// Both parties mix it into the Noise prologue (04), so it must agree end to
+    /// end — this is how the provider learns the consumer principal it cannot
+    /// otherwise see.
+    pub consumer: String,
     /// Model name as advertised by the provider.
     pub model: String,
     /// Billing cap on output tokens (spec 05).
@@ -185,6 +191,7 @@ mod tests {
             session_id: "s1".into(),
             envelope: Envelope {
                 provider: "p@example.com".into(),
+                consumer: "c@example.com".into(),
                 model: "qwen2.5-coder:32b".into(),
                 max_tokens: 2048,
                 est_input_tokens: 850,

@@ -177,11 +177,11 @@ struct ProviderSession {
 async fn run_consumer(listen: String, gateway: String, ahp_token: Option<String>) -> anyhow::Result<()> {
     let static_private = load_consumer_private()?;
     let keybind = keybind_for_private(&static_private);
+    let principal = consumer_principal(ahp_token.as_deref()).await?;
     let state = ConsumerState {
         gateway,
         ahp_token,
-        principal: std::env::var("CHARON_CONSUMER_PRINCIPAL")
-            .unwrap_or_else(|_| charon_core::auth::NutsAuth::dev_principal().to_string()),
+        principal,
         static_private,
         keybind,
         pins: Arc::new(Mutex::new(SimplePinStore::new())),
@@ -258,7 +258,7 @@ async fn run_provider(
                     let hs = decode_blob(&blob)?;
                     let p = prologue(
                         &provider_session.envelope.provider,
-                        &consumer_principal_for_prologue(),
+                        &provider_session.envelope.consumer,
                         &provider_session.envelope.model,
                         provider_session.envelope.max_tokens,
                         &session_id,
@@ -409,6 +409,7 @@ async fn consumer_relay(state: ConsumerState, body: Value) -> anyhow::Result<Vec
     let session_id = uuid::Uuid::new_v4().to_string();
     let envelope = Envelope {
         provider: model.provider.clone(),
+        consumer: state.principal.clone(),
         model: model.name.clone(),
         max_tokens,
         est_input_tokens,
@@ -713,6 +714,23 @@ fn keybind_for_private(private: &[u8; 32]) -> Keybind {
     }
 }
 
+async fn consumer_principal(token: Option<&str>) -> anyhow::Result<String> {
+    let Some(token) = token else {
+        return Ok(charon_core::auth::NutsAuth::dev_principal().to_string());
+    };
+    let disable_auth = env_bool("DISABLE_AUTH");
+    let auth_url = std::env::var("GNOSIS_AUTH_URL")
+        .unwrap_or_else(|_| "https://auth.nuts.services".to_string());
+    let auth = charon_core::auth::NutsAuth::new(auth_url, disable_auth);
+    Ok(auth.validate(token).await?)
+}
+
+fn env_bool(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        .unwrap_or(false)
+}
+
 fn parse_key32_env(name: &str) -> anyhow::Result<[u8; 32]> {
     let value = std::env::var(name).with_context(|| format!("{name} must be set to the provider public key for dev pinning"))?;
     parse_key32(&value)
@@ -761,9 +779,4 @@ fn default_max_tokens() -> u32 {
 
 fn default_context_length() -> u32 {
     4096
-}
-
-fn consumer_principal_for_prologue() -> String {
-    std::env::var("CHARON_CONSUMER_PRINCIPAL")
-        .unwrap_or_else(|_| charon_core::auth::NutsAuth::dev_principal().to_string())
 }

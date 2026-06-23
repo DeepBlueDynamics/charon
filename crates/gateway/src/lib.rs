@@ -668,7 +668,7 @@ async fn process_frame(
             }
             Ok(())
         }
-        Frame::Open { session_id, envelope } => {
+        Frame::Open { session_id, mut envelope } => {
             let conn_info = state.get_connection(connection_id).ok_or_else(|| anyhow::anyhow!("Connection not found"))?;
             
             let consumer_principal = match conn_info.principal {
@@ -688,6 +688,19 @@ async fn process_frame(
                     }
                 }
             };
+
+            if state.disable_auth {
+                envelope.consumer = consumer_principal.clone();
+            } else if envelope.consumer != consumer_principal {
+                let err_frame = Frame::Error {
+                    session_id: Some(session_id.clone()),
+                    code: ErrorCode::AuthFailed,
+                    message: "Envelope consumer principal mismatch".into(),
+                    http_status: Some(401),
+                };
+                let _ = tx.send(err_frame);
+                return Ok(());
+            }
             
             if !state.check_consumer_open_rate_limit(&consumer_principal) {
                 let err_frame = Frame::Error {
