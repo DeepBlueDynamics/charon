@@ -24,3 +24,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 snow = "0.9"            # Noise Protocol (IK / 25519 / ChaChaPoly / BLAKE2s)
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }
+blake2 = "0.10"
+axum = "0.8"
+bytes = "1"
+async-stream = "0.3"

@@ -1,6 +1,6 @@
 //! NUTS token validation against `auth.nuts.services` (spec 02).
 //!
-//! ## Owner: Codex (Respective Bedbug). Implement the `todo!()` bodies.
+//! ## Owner: Codex (Respective Bedbug).
 //!
 //! nuts-auth is Python/FastAPI; validate by token shape:
 //!
@@ -73,12 +73,71 @@ impl NutsAuth {
     }
 
     /// Validate `token` and return its principal (email).
-    ///
-    /// TODO(Codex): if `disable_auth`, return [`Self::dev_principal`]. Else
-    /// branch on [`TokenKind::of`]: POST `{auth_url}/api/validate` for `ahp_`
-    /// (read `subject`), GET `{auth_url}/api/verify` for JWTs (read `sub`).
-    pub async fn validate(&self, _token: &str) -> Result<Principal, AuthError> {
-        let _ = &self.http;
-        todo!("NUTS token validation — see module docs and spec 02")
+    pub async fn validate(&self, token: &str) -> Result<Principal, AuthError> {
+        if self.disable_auth {
+            return Ok(Self::dev_principal().to_string());
+        }
+
+        match TokenKind::of(token) {
+            TokenKind::Ahp => {
+                #[derive(serde::Serialize)]
+                struct ValidateRequest<'a> {
+                    token: &'a str,
+                }
+
+                #[derive(serde::Deserialize)]
+                struct ValidateResponse {
+                    valid: bool,
+                    subject: Option<String>,
+                }
+
+                let url = format!("{}/api/validate", self.auth_url.trim_end_matches('/'));
+                let response = self
+                    .http
+                    .post(url)
+                    .json(&ValidateRequest { token })
+                    .send()
+                    .await
+                    .map_err(|err| AuthError::Transport(err.to_string()))?;
+
+                if !response.status().is_success() {
+                    return Err(AuthError::Invalid);
+                }
+
+                let body: ValidateResponse = response
+                    .json()
+                    .await
+                    .map_err(|err| AuthError::Transport(err.to_string()))?;
+                match (body.valid, body.subject) {
+                    (true, Some(subject)) if !subject.is_empty() => Ok(subject),
+                    _ => Err(AuthError::Invalid),
+                }
+            }
+            TokenKind::Jwt => {
+                #[derive(serde::Deserialize)]
+                struct Claims {
+                    sub: Option<String>,
+                }
+
+                let url = format!("{}/api/verify", self.auth_url.trim_end_matches('/'));
+                let response = self
+                    .http
+                    .get(url)
+                    .bearer_auth(token)
+                    .send()
+                    .await
+                    .map_err(|err| AuthError::Transport(err.to_string()))?;
+
+                if !response.status().is_success() {
+                    return Err(AuthError::Invalid);
+                }
+
+                let claims: Claims = response
+                    .json()
+                    .await
+                    .map_err(|err| AuthError::Transport(err.to_string()))?;
+                claims.sub.filter(|sub| !sub.is_empty()).ok_or(AuthError::Invalid)
+            }
+        }
     }
 }

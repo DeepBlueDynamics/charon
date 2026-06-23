@@ -15,3 +15,4 @@ reqwest.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 snow.workspace = true
+blake2.workspace = true
