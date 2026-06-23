@@ -29,11 +29,11 @@ For step-by-step usage of each role, see the guides in this folder
 ## 2. Google Cloud (to deploy the gateway)
 
 The gateway deploys to Cloud Run exactly like the other nuts.services Rust
-services (project `gnosis-459403`, region `us-central1`).
+services (project `$GCP_PROJECT`, region `us-central1`).
 
-- [ ] Confirm you have access to project **`gnosis-459403`** and it has billing.
+- [ ] Confirm you have access to project **`$GCP_PROJECT`** and it has billing.
 - [ ] Authenticate (interactive — run it yourself in this session):
-      `! gcloud auth login` then `! gcloud config set project gnosis-459403`
+      `! gcloud auth login` then `! gcloud config set project $GCP_PROJECT`
 - [ ] Enable APIs (one-time):
       `! gcloud services enable run.googleapis.com cloudbuild.googleapis.com artifactregistry.googleapis.com`
 - [ ] Decide: do you want **me to run the deploy** once you've authenticated, or
@@ -83,5 +83,5 @@ cargo run -p charon -- consumer --listen 127.0.0.1:8088
 ### Hand back to me
 The fastest unblock: **(1) the keybind primitive**, **(1) the payment rail +
 mint URL**, and **(2) confirmation you can `gcloud auth login` to
-`gnosis-459403`**. With those three I can close the MITM gap, start real
+`$GCP_PROJECT`**. With those three I can close the MITM gap, start real
 payments, and deploy.

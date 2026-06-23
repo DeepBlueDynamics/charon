@@ -27,9 +27,9 @@ The gateway deploys exactly like the other nuts.services Rust services
 (`nuts-proxy`, `sdrrand`, `shivvr`): a two-stage Rust → distroless image, pushed
 to GCR, deployed to Cloud Run, fronted by a `*.nuts.services` domain mapping.
 
-- **Project:** `gnosis-459403` · **Region:** `us-central1`
+- **Project:** `$GCP_PROJECT` (set to your own GCP project id) · **Region:** `us-central1`
 - **Service name:** `charon-gateway` · **Domain:** `charon.nuts.services`
-- **Image:** `gcr.io/gnosis-459403/charon-gateway`
+- **Image:** `gcr.io/$GCP_PROJECT/charon-gateway`
 - **Listen:** `0.0.0.0:$PORT` (Cloud Run injects `PORT`; default `8080`).
 
 ### WebSocket-specific settings
@@ -46,10 +46,10 @@ The gateway holds long-lived WS connections, so it MUST be deployed with:
 ### Deploy
 
 ```bash
-gcloud config set project gnosis-459403
-gcloud builds submit --tag gcr.io/gnosis-459403/charon-gateway
+gcloud config set project $GCP_PROJECT
+gcloud builds submit --tag gcr.io/$GCP_PROJECT/charon-gateway
 gcloud run deploy charon-gateway \
-  --image gcr.io/gnosis-459403/charon-gateway \
+  --image gcr.io/$GCP_PROJECT/charon-gateway \
   --region us-central1 --allow-unauthenticated \
   --port 8080 --timeout 3600 --min-instances 1 \
   --session-affinity --concurrency 80 --cpu 1 --memory 512Mi \

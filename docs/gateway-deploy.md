@@ -25,17 +25,17 @@ DISABLE_AUTH=true cargo run -p charon-gateway -- --bind 127.0.0.1:8080
 
 ## Google Cloud Run production deployment
 
-In production, the gateway is deployed to Google Cloud Run in the `gnosis-459403` project. Because the gateway holds active WebSocket connections, specific flags must be supplied.
+In production, the gateway is deployed to Google Cloud Run. Set `$GCP_PROJECT` to your own GCP project id before running any command below — e.g. `export GCP_PROJECT=your-gcp-project`. Because the gateway holds active WebSocket connections, specific flags must be supplied.
 
 ### Docker build and push
 Submit the container build to Google Cloud Build.
 
 ```bash
 # Configure gcloud project
-gcloud config set project gnosis-459403
+gcloud config set project $GCP_PROJECT
 
 # Submit the build to Artifact Registry / Container Registry
-gcloud builds submit --tag gcr.io/gnosis-459403/charon-gateway
+gcloud builds submit --tag gcr.io/$GCP_PROJECT/charon-gateway
 #
 # Response:
 # SUCCESS: Image built and pushed
@@ -47,7 +47,7 @@ Run the deploy command with session affinity and extended timeouts to keep WebSo
 ```bash
 # Deploy to Google Cloud Run in us-central1
 gcloud run deploy charon-gateway \
-  --image gcr.io/gnosis-459403/charon-gateway \
+  --image gcr.io/$GCP_PROJECT/charon-gateway \
   --region us-central1 \
   --allow-unauthenticated \
   --port 8080 \
