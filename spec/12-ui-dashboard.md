@@ -40,12 +40,16 @@ The dashboard uses the **browser JWT** flow, not the daemon `ahp_` flow (02):
    (free, 09) and, optionally, BARKER ads (08). Filter/sort by price, rating,
    model. "Pin provider" adds it to the consumer's trusted set (02).
 3. **Wallet / payments** — balance and history; **fund** via:
-   - **Lightning** — the dashboard requests a BOLT11 invoice and shows a
-     QR/`lightning:` URI; on payment the balance (or a Cashu token) is credited.
+   - **Lightning** — the dashboard requests a BOLT11 invoice and MUST render it
+     as a **scannable QR code** plus a copyable `lightning:` URI; on payment the
+     balance (or a Cashu token) is credited.
    - **Cashu** — paste/redeem a `cashuB` token, or mint from a Lightning deposit
-     at an allowlisted mint (recommended for payer privacy, 05).
-   Shows the per-request **estimate** (calls `estimate-cost`, 05) so the user
-   sees a price before paying.
+     at an allowlisted mint (recommended for payer privacy, 05). A `cashuB` token
+     to be claimed SHOULD also render as a QR code.
+   **QR codes are required** wherever the user pays or claims (Lightning invoices,
+   Cashu tokens) so a phone wallet can scan directly. Amounts are small (sats),
+   so the flow favors speed: scan, pay, go. Shows the per-request **estimate**
+   (calls `estimate-cost`, 05) so the user sees a price before paying.
 4. **Provider console** — declare `[[models]]` + prices, toggle advertised,
    view earnings and the **payout address** (BOLT12 / `lno1…`, 06), and ratings.
 5. **Consumer console** — manage pins, set per-request/per-session **budget
