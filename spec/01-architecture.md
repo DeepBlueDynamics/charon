@@ -79,8 +79,10 @@ prompt or the answer.
   transient relay state plus a settlement ledger and a reputation store (09).
 - Provider proxy: a container or binary on the provider's machine, next to
   Ollama. No inbound ports.
-- Consumer proxy: a binary or sidecar on the consumer's machine; for Nemesis8 it
-  is reachable from the sealed container at `host.docker.internal` (07).
+- Consumer proxy (the client): a container, run as a **sidecar** in the
+  Nemesis8 session network (reachable at `http://charon-proxy:8088`) or as a
+  single binary on the host (`host.docker.internal`). Same image as the provider
+  proxy, selected by role (07).
 
 ## NUTS ecosystem mapping
 

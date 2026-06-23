@@ -5,9 +5,11 @@ and point it at a shared model.*
 
 ## The consumer proxy
 
-A local process that presents a **plain OpenAI-compatible API** to any agent and
-does all the marketplace work behind it. The agent stays oblivious to NUTS,
-encryption, and sats.
+The **client**: a containerized process that presents a **plain
+OpenAI-compatible API** to any agent and does all the marketplace work behind it.
+The agent stays oblivious to NUTS, encryption, and sats. It ships as the same
+`charon` container image as the provider proxy (06), selected by role
+(`charon consumer`); a single static binary is also available for host runs.
 
 ### Surfaces (to the agent, localhost)
 - `POST /v1/chat/completions` (streaming + buffered) — the main path.
@@ -45,18 +47,24 @@ local models) via a `.nemesis8.toml` at the project root. Charon plugs in as one
 such provider.
 
 ### Where the proxy runs
-**RECOMMENDED:** consumer proxy runs on the **host**; the sealed container
-reaches it at `host.docker.internal`. Grant the container network access to
-*only* that endpoint at spawn — the agent can use the remote model and nothing
-else (a tight, on-theme sandbox). Alternatively run the proxy as a **sidecar**
-in the session's network namespace (`http://charon-proxy:PORT`).
+**RECOMMENDED:** the consumer proxy runs as a **sidecar container** in the
+session's network namespace, reachable from the sealed agent container at
+`http://charon-proxy:8088/v1`. Nemesis8 brings it up next to the agent and
+network-scopes the agent to reach *only* that endpoint — the agent can use the
+remote model and nothing else (a tight, on-theme sandbox), and teardown removes
+both containers together. The proxy holds the consumer's secrets (NUTS token,
+wallet, pins) in the sidecar, never in the agent container.
+
+**Alternative (host mode):** run the proxy as a single binary on the **host**;
+the sealed container reaches it at `http://host.docker.internal:8088/v1`. Use
+this for a shared, long-lived proxy across many sessions.
 
 ### `.nemesis8.toml` provider block
 
 ```toml
 [providers.charon]
 type     = "openai"
-base_url = "http://host.docker.internal:8088/v1"
+base_url = "http://charon-proxy:8088/v1"   # sidecar; host mode: http://host.docker.internal:8088/v1
 api_key  = "unused"                 # proxy authenticates upstream via NUTS, not this
 models   = ["qwen2.5-coder:32b", "llama3.3:70b"]
 
@@ -67,12 +75,14 @@ default = "charon"
 ```
 
 ### Launch flow
-1. Consumer proxy is running on the host (NUTS token + wallet + pins loaded).
+1. Nemesis8 starts the consumer-proxy **sidecar** container (NUTS token + wallet
+   + pins mounted as config/secrets) on the session network.
 2. `nemesis8` spawns the coding agent (Claude Code, OpenClaw, Cline, Aider, …)
-   in a sealed container, network-scoped to the proxy endpoint.
-3. The agent calls `host.docker.internal:8088/v1` like any OpenAI server.
+   in a sealed container on the same network, scoped to reach only the sidecar.
+3. The agent calls `http://charon-proxy:8088/v1` like any OpenAI server.
 4. The proxy resolves → pays → encrypts → relays → decrypts → streams back.
-5. Teardown leaves no inbound exposure; session history persists in Nemesis8.
+5. Teardown tears down both containers; no inbound exposure remains; session
+   history persists in Nemesis8.
 
 ## Model selection is the consumer's job
 

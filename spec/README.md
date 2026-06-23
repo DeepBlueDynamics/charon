@@ -29,6 +29,7 @@ prompt or a reply.
 | 08 | [discovery-reputation](./08-discovery-reputation.md) | Directory, BARKER, portable signed ratings |
 | 09 | [gateway](./09-gateway.md) | Blind-relay responsibilities, state, rate limits |
 | 10 | [security-threat-model](./10-security-threat-model.md) | Threats, mitigations, residual risk |
+| 11 | [deployment](./11-deployment.md) | Container roster, Cloud Run (nuts.services), auth wiring |
 
 ## Conventions
 
