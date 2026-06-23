@@ -16,8 +16,9 @@ nothing about its passengers.
   sells chosen models.
 - **Service** (`charon-gateway`) — the blind relay: authenticates both sides,
   matches them, relays ciphertext, settles payment, aggregates reputation.
-- **Dashboard** (planned) — a web UI to log in (NUTS), browse provider
-  advertisements, and fund/settle payments. See [spec 12](./spec/12-ui-dashboard.md).
+- **Dashboard** (in progress) — a web UI to log in (NUTS), browse provider
+  advertisements, and fund/settle payments, deploying to
+  `dashboard.charon.nuts.services`. See [spec 12](./spec/12-ui-dashboard.md).
 
 ## Payments
 
@@ -58,12 +59,31 @@ cargo run -p charon -- provider --ollama http://localhost:11434
 
 `cargo test --workspace` runs the contract + pricing tests.
 
+## Docs
+
+Practical guides live in [`docs/`](./docs) (start at [`docs/README.md`](./docs/README.md)):
+
+- [Quickstart](./docs/quickstart.md) — run the whole marketplace locally in dev.
+- [Provider guide](./docs/provider-guide.md) · [Consumer guide](./docs/consumer-guide.md)
+- [Gateway deploy](./docs/gateway-deploy.md) — dev + Cloud Run.
+- [API reference](./docs/api-reference.md) — gateway control-plane + consumer OpenAI endpoints.
+- [Setup checklist](./docs/setup-checklist.md) — operator action items (accounts, DNS, decisions).
+
 ## Status
 
-Early. The protocol crates compile and the gateway relays opaque frames; the
-end-to-end inference path (consumer handshake → relay → Ollama) and real
-payment rails are in progress. Tracking notes live in the commit history and
-the specs; where code and spec disagree, the spec wins.
+Working in dev, not yet production. What's done:
+
+- Protocol crates compile; `cargo test --workspace` is green.
+- **End-to-end inference relays in dev**: consumer → gateway → provider and back,
+  encrypted under Noise IK (the gateway never holds a session key).
+- Gateway is a blind WS relay plus an HTTP control-plane API
+  (`/v1/directory`, `/v1/quote`, reputation) with CORS for the dashboard.
+- Consumer exposes an OpenAI-compatible API; provider proxies Ollama.
+
+In progress / not done: real payment rails (Cashu/L402 — currently a dev-accept
+stub), the NUTS-identity keybind signature (MITM defense T2 is partially open),
+the dashboard, and the Cloud Run deployment. Where code and spec disagree, the
+spec wins.
 
 ## Specifications
 
