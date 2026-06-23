@@ -30,6 +30,7 @@ prompt or a reply.
 | 09 | [gateway](./09-gateway.md) | Blind-relay responsibilities, state, rate limits |
 | 10 | [security-threat-model](./10-security-threat-model.md) | Threats, mitigations, residual risk |
 | 11 | [deployment](./11-deployment.md) | Container roster, Cloud Run (nuts.services), auth wiring |
+| 12 | [ui-dashboard](./12-ui-dashboard.md) | Web UI: NUTS login, provider ads, payments; gateway HTTP API |
 
 ## Conventions
 
