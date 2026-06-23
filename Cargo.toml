@@ -31,3 +31,7 @@ bytes = "1"
 async-stream = "0.3"
 toml = "0.8"
 x25519-dalek = { version = "2", features = ["static_secrets"] }
+cdk = { version = "0.17.1", default-features = false, features = ["wallet"] }
+cdk-http-client = { version = "0.17.1" }
+cdk-sqlite = { version = "0.17.1", default-features = false, features = ["wallet"] }
+

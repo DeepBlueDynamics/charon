@@ -28,24 +28,130 @@ pub trait Authenticator: Send + Sync {
 
 // PaymentVerifier seam
 pub trait PaymentVerifier: Send + Sync {
-    fn verify_payment(
-        &self,
-        payment: &charon_core::wire::Payment,
+    fn verify_payment<'a>(
+        &'a self,
+        payment: &'a charon_core::wire::Payment,
         expected_total_msat: u64,
-    ) -> Result<(), ErrorCode>;
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ErrorCode>> + Send + 'a>>;
 }
 
 pub struct DevPaymentVerifier;
 
 impl PaymentVerifier for DevPaymentVerifier {
-    fn verify_payment(
-        &self,
-        _payment: &charon_core::wire::Payment,
+    fn verify_payment<'a>(
+        &'a self,
+        _payment: &'a charon_core::wire::Payment,
         _expected_total_msat: u64,
-    ) -> Result<(), ErrorCode> {
-        Ok(())
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ErrorCode>> + Send + 'a>> {
+        Box::pin(async move { Ok(()) })
     }
 }
+
+pub struct CashuVerifier {
+    pub allowlist: HashSet<String>,
+    pub mock_amount: Option<u64>,
+}
+
+impl CashuVerifier {
+    pub fn new(allowlist: HashSet<String>) -> Self {
+        Self {
+            allowlist,
+            mock_amount: None,
+        }
+    }
+
+    pub fn new_with_mock(allowlist: HashSet<String>, mock_amount: u64) -> Self {
+        Self {
+            allowlist,
+            mock_amount: Some(mock_amount),
+        }
+    }
+}
+
+impl PaymentVerifier for CashuVerifier {
+    fn verify_payment<'a>(
+        &'a self,
+        payment: &'a charon_core::wire::Payment,
+        expected_total_msat: u64,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ErrorCode>> + Send + 'a>> {
+        Box::pin(async move {
+            match payment {
+                charon_core::wire::Payment::Cashu { token: token_str } => {
+                    use std::str::FromStr;
+                    // 1. parse cashuB token with cdk
+                    let token = cdk::nuts::nut00::Token::from_str(token_str)
+                        .map_err(|e| {
+                            tracing::error!("Failed to parse Cashu token: {:?}", e);
+                            ErrorCode::PaymentRequired
+                        })?;
+
+                    // 2. confirm mint URL is allowlisted
+                    let mint_url = token.mint_url().map_err(|e| {
+                        tracing::error!("Failed to get mint URL from token: {:?}", e);
+                        ErrorCode::PaymentRequired
+                    })?;
+                    let mint_url_str = mint_url.to_string();
+                    if !self.allowlist.contains(&mint_url_str) {
+                        tracing::warn!("Mint URL {} is not allowlisted", mint_url_str);
+                        return Err(ErrorCode::PaymentRequired);
+                    }
+
+                    // 3. redeem/swap proofs via cdk
+                    let amount_msat = if let Some(mock_val) = self.mock_amount {
+                        mock_val
+                    } else {
+                        let mut seed = [0u8; 64];
+                        for chunk in seed.chunks_mut(16) {
+                            chunk.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+                        }
+
+                        let localstore = cdk_sqlite::wallet::memory::empty().await
+                            .map_err(|e| {
+                                tracing::error!("Failed to initialize in-memory wallet database: {:?}", e);
+                                ErrorCode::PaymentRequired
+                            })?;
+
+                        let unit = token.unit().unwrap_or(cdk::nuts::CurrencyUnit::Sat);
+                        let wallet = cdk::wallet::Wallet::new(
+                            &mint_url_str,
+                            unit.clone(),
+                            Arc::new(localstore),
+                            seed,
+                            None,
+                        ).map_err(|e| {
+                            tracing::error!("Failed to initialize wallet: {:?}", e);
+                            ErrorCode::PaymentRequired
+                        })?;
+
+                        // Claim/swap the token
+                        let amount = wallet.receive(token_str, cdk::wallet::ReceiveOptions::default()).await
+                            .map_err(|e| {
+                                tracing::error!("Cashu redeem/swap failed: {:?}", e);
+                                ErrorCode::PaymentRequired
+                            })?;
+
+                        amount.with_unit(unit).to_msat().map_err(|e| {
+                            tracing::error!("Failed to convert amount to msat: {:?}", e);
+                            ErrorCode::PaymentRequired
+                        })?
+                    };
+
+                    if amount_msat < expected_total_msat {
+                        tracing::warn!("Underpaid: expected {}, received {}", expected_total_msat, amount_msat);
+                        return Err(ErrorCode::Underpaid);
+                    }
+
+                    Ok(())
+                }
+                _ => {
+                    tracing::warn!("Payment rail not supported in production mode");
+                    Err(ErrorCode::PaymentRequired)
+                }
+            }
+        })
+    }
+}
+
 
 pub struct GnosisAuthenticator {
     nuts: charon_core::auth::NutsAuth,
@@ -864,7 +970,7 @@ async fn process_frame(
                 state.floor_msat,
             );
             
-            if let Err(err_code) = state.payment_verifier.verify_payment(&envelope.payment, quote.total_msat) {
+            if let Err(err_code) = state.payment_verifier.verify_payment(&envelope.payment, quote.total_msat).await {
                 let err_frame = Frame::Error {
                     session_id: Some(session_id.clone()),
                     code: err_code,
@@ -888,6 +994,11 @@ async fn process_frame(
             };
             
             state.add_session(session_info);
+
+            // Record Cashu settlement split (gateway keeps gateway_msat, provider credited provider_msat)
+            // TODO: Provider P2PK payout + change/refund are follow-ups.
+            state.record_wallet_event("gateway", "cashu_fee", quote.gateway_msat as i64, "settled");
+            state.record_wallet_event(&provider.principal, "cashu_credit", quote.provider_msat as i64, "settled");
             
             let _ = tx.send(Frame::OpenOk {
                 session_id: session_id.clone(),
@@ -1133,3 +1244,55 @@ pub async fn run_server(
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use charon_core::wire::Payment;
+    use std::collections::HashSet;
+
+    const MOCK_TOKEN: &str = "cashuAeyJ0b2tlbiI6W3sicHJvb2ZzIjpbeyJhbW91bnQiOjEsInNlY3JldCI6ImI0ZjVlNDAxMDJhMzhiYjg3NDNiOTkwMzU5MTU1MGYyZGEzZTQxNWEzMzU0OTUyN2M2MmM5ZDc5MGVmYjM3MDUiLCJDIjoiMDIzYmU1M2U4YzYwNTMwZWVhOWIzOTQzZmRhMWEyY2U3MWM3YjNmMGNmMGRjNmQ4NDZmYTc2NWFhZjc3OWZhODFkIiwiaWQiOiIwMDlhMWYyOTMyNTNlNDFlIn1dLCJtaW50IjoiaHR0cHM6Ly90ZXN0bnV0LmNhc2h1LnNwYWNlIn1dLCJ1bml0Ijoic2F0In0=";
+
+    #[tokio::test]
+    async fn test_cashu_verifier_allowlist_rejection() {
+        let verifier = CashuVerifier::new_with_mock(HashSet::new(), 1000);
+        let payment = Payment::Cashu { token: MOCK_TOKEN.to_string() };
+        let res = verifier.verify_payment(&payment, 1000).await;
+        assert_eq!(res, Err(ErrorCode::PaymentRequired));
+    }
+
+    #[tokio::test]
+    async fn test_cashu_verifier_allowlist_acceptance_but_underpaid() {
+        let mut allowlist = HashSet::new();
+        allowlist.insert("https://testnut.cashu.space".to_string());
+        
+        let verifier = CashuVerifier::new_with_mock(allowlist, 500);
+        let payment = Payment::Cashu { token: MOCK_TOKEN.to_string() };
+        let res = verifier.verify_payment(&payment, 1000).await;
+        assert_eq!(res, Err(ErrorCode::Underpaid));
+    }
+
+    #[tokio::test]
+    async fn test_cashu_verifier_success() {
+        let mut allowlist = HashSet::new();
+        allowlist.insert("https://testnut.cashu.space".to_string());
+        
+        let verifier = CashuVerifier::new_with_mock(allowlist, 1000);
+        let payment = Payment::Cashu { token: MOCK_TOKEN.to_string() };
+        let res = verifier.verify_payment(&payment, 1000).await;
+        assert_eq!(res, Ok(()));
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn test_cashu_verifier_live_mint_redemption() {
+        let mut allowlist = HashSet::new();
+        allowlist.insert("https://testnut.cashu.space".to_string());
+        
+        let verifier = CashuVerifier::new(allowlist);
+        let payment = Payment::Cashu { token: MOCK_TOKEN.to_string() };
+        let res = verifier.verify_payment(&payment, 1000).await;
+        assert_eq!(res, Err(ErrorCode::PaymentRequired));
+    }
+}
+
