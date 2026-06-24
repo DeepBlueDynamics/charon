@@ -106,6 +106,7 @@ The authoritative description lives in [`spec/`](./spec). Start with
 - [12 — UI / Dashboard](./spec/12-ui-dashboard.md)
 - [13 — MCP Server](./spec/13-mcp.md)
 - [14 — Compute (training/rental)](./spec/14-compute.md) — draft/roadmap
+- [15 — Approval Console](./spec/15-approval-console.md) — draft
 
 ## Related
 
