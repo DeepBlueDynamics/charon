@@ -11,19 +11,29 @@ You need the `charon` client binary, access to a running Ollama server, and a NU
 
 ## Identity and key binding
 
-To protect consumer prompts, the marketplace enforces end-to-end encryption. You must generate an X25519 keypair and bind it to your NUTS identity.
+To protect consumer prompts, the marketplace enforces end-to-end encryption. You need an X25519 keypair bound to your NUTS identity. Generate both with one command:
 
-1. **X25519 keypair:** Create a 32-byte private key file. You can encode the key as Base64 or prefix it with `hex:` for hexadecimal.
-2. **Keybind file:** Create a JSON file containing your public key and its NUTS signature. **Important:** The consumer proxy will verify this signature against your identity. If it is invalid, connections are aborted.
+```bash
+charon keygen --out ~/.charon
+# wrote ~/.charon/x25519.key
+# wrote ~/.charon/keybind.json
+# x25519_pub: 5brA7IJAmbYKpGltOQ19K+UihF/u1gjyBLBXtBodKV0=
+```
+
+This writes:
+1. **`x25519.key`** — your 32-byte static private key (Base64; `hex:` prefix also accepted).
+2. **`keybind.json`** — your public key + its signature, which the consumer pins and verifies:
 
 ```json
 // keybind.json
 {
-  "x25519_pub": "5N4zY9Z5Sg3/2837482394782397489237498237489=",
-  "sig": "signature_from_nuts_auth_services",
-  "not_after": 1729168400
+  "x25519_pub": "5brA7IJAmbYKpGltOQ19K+UihF/u1gjyBLBXtBodKV0=",
+  "sig": "dev-keybind",
+  "not_after": 0
 }
 ```
+
+**Note:** `keygen` currently writes a dev signature. Production keybinds are signed by your NUTS/Nostr identity so the binding cannot be forged by the gateway — that signing step is coming. Point your config's `[identity]` block at these two files (below).
 
 ## Configuration file
 

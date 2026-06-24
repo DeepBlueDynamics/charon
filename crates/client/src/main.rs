@@ -59,6 +59,12 @@ enum Role {
         #[arg(long, env = "OLLAMA_BASE_URL", default_value = "http://localhost:11434")]
         ollama: String,
     },
+    /// Generate an X25519 identity key + keybind (for a provider or consumer).
+    Keygen {
+        /// Output directory (writes x25519.key and keybind.json).
+        #[arg(long, default_value = ".")]
+        out: String,
+    },
 }
 
 #[tokio::main]
@@ -70,7 +76,34 @@ async fn main() -> anyhow::Result<()> {
     match cli.role {
         Role::Consumer { listen } => run_consumer(listen, cli.gateway, cli.ahp_token, cli.cashu_mint).await,
         Role::Provider { config, ollama } => run_provider(config, ollama, cli.gateway, cli.ahp_token).await,
+        Role::Keygen { out } => run_keygen(out),
     }
+}
+
+fn run_keygen(out: String) -> anyhow::Result<()> {
+    // Random 32-byte X25519 secret (clamped on use). Derive the public key and
+    // write the key file + a keybind the provider/consumer config points at.
+    let mut priv_bytes = [0u8; 32];
+    for chunk in priv_bytes.chunks_mut(16) {
+        chunk.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    }
+    let keybind = keybind_for_private(&priv_bytes);
+    std::fs::create_dir_all(&out)?;
+    let dir = std::path::Path::new(&out);
+    let key_path = dir.join("x25519.key");
+    let kb_path = dir.join("keybind.json");
+    std::fs::write(&key_path, BASE64.encode(priv_bytes))?;
+    std::fs::write(&kb_path, serde_json::to_string_pretty(&keybind)?)?;
+    println!("wrote {}", key_path.display());
+    println!("wrote {}", kb_path.display());
+    println!("x25519_pub: {}\n", keybind.x25519_pub);
+    println!("Point your provider config at these:");
+    println!("  [identity]");
+    println!("  x25519_key_file = \"{}\"", key_path.display());
+    println!("  keybind_file    = \"{}\"", kb_path.display());
+    println!("\nNote: this keybind carries a dev signature for now. Production keybinds");
+    println!("are signed by your NUTS/Nostr identity so the binding cannot be forged.");
+    Ok(())
 }
 
 #[derive(Clone)]
