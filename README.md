@@ -104,6 +104,8 @@ The authoritative description lives in [`spec/`](./spec). Start with
 - [10 — Security & Threat Model](./spec/10-security-threat-model.md)
 - [11 — Deployment](./spec/11-deployment.md)
 - [12 — UI / Dashboard](./spec/12-ui-dashboard.md)
+- [13 — MCP Server](./spec/13-mcp.md)
+- [14 — Compute (training/rental)](./spec/14-compute.md) — draft/roadmap
 
 ## Related
 

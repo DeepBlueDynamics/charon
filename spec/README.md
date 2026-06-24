@@ -32,6 +32,7 @@ prompt or a reply.
 | 11 | [deployment](./11-deployment.md) | Container roster, Cloud Run (nuts.services), auth wiring |
 | 12 | [ui-dashboard](./12-ui-dashboard.md) | Web UI: NUTS login, provider ads, payments; gateway HTTP API |
 | 13 | [mcp](./13-mcp.md) | MCP server: buy inference as tools; 402 pay-required with ASCII-QR invoice |
+| 14 | [compute](./14-compute.md) | **Draft/roadmap** — training & GPU-rental jobs: lifecycle, escrow, the (non-blind) privacy caveat |
 
 ## Conventions
 
