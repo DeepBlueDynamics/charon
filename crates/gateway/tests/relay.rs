@@ -16,7 +16,9 @@ async fn test_relay_flow_and_injection_prevention() {
     
     let authenticator = Arc::new(GnosisAuthenticator::new("".to_string(), true));
     let payment_verifier = Arc::new(DevPaymentVerifier);
+    let store = Arc::new(charon_gateway::InMemoryStore::new());
     let state = Arc::new(GatewayState::new(
+        store,
         authenticator,
         payment_verifier,
         true, // disable_auth
@@ -224,7 +226,9 @@ async fn test_non_dev_mode_consumer_verification() {
 
     let authenticator = Arc::new(MockAuthenticator);
     let payment_verifier = Arc::new(DevPaymentVerifier);
+    let store = Arc::new(charon_gateway::InMemoryStore::new());
     let state = Arc::new(GatewayState::new(
+        store,
         authenticator,
         payment_verifier,
         false, // disable_auth = false (non-dev mode)
@@ -371,7 +375,9 @@ async fn test_cors_preflight_and_origins() {
 
     let authenticator = Arc::new(GnosisAuthenticator::new("".to_string(), true));
     let payment_verifier = Arc::new(DevPaymentVerifier);
+    let store = Arc::new(charon_gateway::InMemoryStore::new());
     let state = Arc::new(GatewayState::new(
+        store,
         authenticator,
         payment_verifier,
         true, // disable_auth
@@ -451,14 +457,8 @@ async fn test_wallet_history_retention_and_isolation() {
 
     let authenticator = Arc::new(MockAuthenticator);
     let payment_verifier = Arc::new(DevPaymentVerifier);
-    let state = Arc::new(GatewayState::new(
-        authenticator,
-        payment_verifier,
-        false, // disable_auth = false (so it checks Bearer token)
-        1000,
-        21000,
-    ));
-
+    let store = Arc::new(charon_gateway::InMemoryStore::new());
+    
     // Populate wallet histories
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
@@ -466,7 +466,7 @@ async fn test_wallet_history_retention_and_isolation() {
     let new_ts = now.saturating_sub(5 * 24 * 60 * 60);  // 5 days ago (newer than 14 days)
 
     {
-        let mut wallets = state.wallets.lock().unwrap();
+        let mut wallets = store.wallets.lock().unwrap();
         
         // consumer_a: has one new entry and one old entry
         let wallet_a = wallets.entry("consumer_a".to_string()).or_default();
@@ -494,6 +494,15 @@ async fn test_wallet_history_retention_and_isolation() {
             status: "settled".to_string(),
         });
     }
+
+    let state = Arc::new(GatewayState::new(
+        store.clone(),
+        authenticator,
+        payment_verifier,
+        false, // disable_auth = false
+        1000,
+        21000,
+    ));
 
     let state_clone = state.clone();
     tokio::spawn(async move {

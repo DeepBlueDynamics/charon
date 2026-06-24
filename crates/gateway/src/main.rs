@@ -64,7 +64,9 @@ async fn main() -> anyhow::Result<()> {
         Arc::new(CashuVerifier::new(allowlist))
     };
 
+    let store = charon_gateway::detect_store().await;
     let state = Arc::new(GatewayState::new(
+        store,
         authenticator,
         payment_verifier,
         args.disable_auth,

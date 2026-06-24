@@ -34,4 +34,8 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 cdk = { version = "0.17.1", default-features = false, features = ["wallet"] }
 cdk-http-client = { version = "0.17.1" }
 cdk-sqlite = { version = "0.17.1", default-features = false, features = ["wallet"] }
+firestore = "0.43.0"
+google-cloud-storage = "0.22.1"
+
+
 

@@ -32,6 +32,8 @@ cdk.workspace = true
 cdk-http-client.workspace = true
 cdk-sqlite.workspace = true
 sha2 = "0.10"
+firestore.workspace = true
+google-cloud-storage.workspace = true
 
 [dev-dependencies]
 

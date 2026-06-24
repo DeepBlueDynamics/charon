@@ -17,6 +17,7 @@ use uuid::Uuid;
 use charon_core::{Frame, Envelope, ModelCard, Keybind, ErrorCode};
 use charon_core::wire::Payout;
 use charon_core::payment::Rate;
+use firestore::{paths, FirestoreDb};
 
 // Authenticator seam (object-safe)
 pub trait Authenticator: Send + Sync {
@@ -186,7 +187,7 @@ impl Authenticator for GnosisAuthenticator {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct ProviderConnection {
     pub principal: String,
     pub models: Vec<ModelCard>,
@@ -236,13 +237,740 @@ pub struct UserWallet {
     pub history: Vec<WalletEntry>,
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WalletDoc {
+    pub balance_msat: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SettlementDoc {
+    pub session_id: String,
+    pub consumer: String,
+    pub provider: String,
+    pub total_msat: u64,
+    pub gateway_msat: u64,
+    pub provider_msat: u64,
+    pub outcome: String,
+    pub ts: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RatingDoc {
+    pub rating_id: String,
+    pub provider: String,
+    pub rater: String,
+    pub session_id: String,
+    pub score: u8,
+    pub settled_msat: u64,
+    pub rating_json: String,
+    pub ts: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProviderDoc {
+    pub principal: String,
+    pub handle: String,
+    pub models: Vec<ModelCard>,
+    pub keybind: Keybind,
+    pub payout: Payout,
+    pub connection_id: String,
+    pub last_seen: u64,
+}
+
+pub type StoreResult<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<T>> + Send + 'a>>;
+
+pub trait Store: Send + Sync {
+    fn get_balance<'a>(&'a self, principal: &'a str) -> StoreResult<'a, u64>;
+    fn record_wallet_event<'a>(&'a self, principal: &'a str, kind: &'a str, amount_msat: i64, status: &'a str) -> StoreResult<'a, ()>;
+    fn get_wallet_history<'a>(&'a self, principal: &'a str) -> StoreResult<'a, Vec<WalletEntry>>;
+    fn record_settlement<'a>(&'a self, session_id: &'a str, consumer: &'a str, provider: &'a str, total_msat: u64, gateway_msat: u64, provider_msat: u64, outcome: &'a str) -> StoreResult<'a, ()>;
+    fn register_provider(&self, provider: ProviderConnection) -> StoreResult<'_, ()>;
+    fn update_provider_heartbeat<'a>(&'a self, principal: &'a str) -> StoreResult<'a, ()>;
+    fn get_provider<'a>(&'a self, principal: &'a str) -> StoreResult<'a, Option<ProviderConnection>>;
+    fn find_provider_by_handle<'a>(&'a self, handle: &'a str) -> StoreResult<'a, Option<ProviderConnection>>;
+    fn get_active_providers(&self) -> StoreResult<'_, Vec<ProviderConnection>>;
+    fn remove_provider<'a>(&'a self, principal: &'a str) -> StoreResult<'a, ()>;
+    fn add_rating(&self, rating: serde_json::Value) -> StoreResult<'_, ()>;
+    fn get_reputation<'a>(&'a self, principal: &'a str) -> StoreResult<'a, ReputationResponse>;
+    fn upload_receipt<'a>(&'a self, session_id: &'a str, data: &'a [u8]) -> StoreResult<'a, ()>;
+    fn upload_attestation<'a>(&'a self, rating_id: &'a str, data: &'a [u8]) -> StoreResult<'a, ()>;
+}
+
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct InMemoryProvider {
+    pub provider: ProviderConnection,
+    pub last_seen: u64,
+}
+
+pub struct InMemoryStore {
+    pub wallets: Mutex<HashMap<String, UserWallet>>,
+    pub settlements: Mutex<HashMap<String, SettlementDoc>>,
+    pub providers: Mutex<HashMap<String, InMemoryProvider>>,
+    pub ratings: Mutex<Vec<serde_json::Value>>,
+    pub gcs_blobs: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+impl InMemoryStore {
+    pub fn new() -> Self {
+        Self {
+            wallets: Mutex::new(HashMap::new()),
+            settlements: Mutex::new(HashMap::new()),
+            providers: Mutex::new(HashMap::new()),
+            ratings: Mutex::new(Vec::new()),
+            gcs_blobs: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl Store for InMemoryStore {
+    fn get_balance<'a>(&'a self, principal: &'a str) -> StoreResult<'a, u64> {
+        Box::pin(async move {
+            let mut wallets = self.wallets.lock().unwrap();
+            let wallet = wallets.entry(principal.to_string()).or_insert_with(|| UserWallet {
+                balance_msat: 10_000_000_000,
+                history: Vec::new(),
+            });
+            Ok(wallet.balance_msat)
+        })
+    }
+
+    fn record_wallet_event<'a>(&'a self, principal: &'a str, kind: &'a str, amount_msat: i64, status: &'a str) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let entry = WalletEntry {
+                ts,
+                r#type: kind.to_string(),
+                amount_msat,
+                status: status.to_string(),
+            };
+
+            let mut wallets = self.wallets.lock().unwrap();
+            let wallet = wallets.entry(principal.to_string()).or_insert_with(|| UserWallet {
+                balance_msat: 10_000_000_000,
+                history: Vec::new(),
+            });
+
+            if amount_msat >= 0 {
+                wallet.balance_msat = wallet.balance_msat.saturating_add(amount_msat as u64);
+            } else {
+                let amount_abs = amount_msat.unsigned_abs();
+                wallet.balance_msat = wallet.balance_msat.saturating_sub(amount_abs);
+            }
+
+            wallet.history.push(entry);
+            Ok(())
+        })
+    }
+
+    fn get_wallet_history<'a>(&'a self, principal: &'a str) -> StoreResult<'a, Vec<WalletEntry>> {
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let cutoff = now.saturating_sub(14 * 24 * 60 * 60);
+
+            let mut wallets = self.wallets.lock().unwrap();
+            let wallet = wallets.entry(principal.to_string()).or_insert_with(|| UserWallet {
+                balance_msat: 10_000_000_000,
+                history: Vec::new(),
+            });
+
+            wallet.history.retain(|e| e.ts >= cutoff);
+            Ok(wallet.history.clone())
+        })
+    }
+
+    fn record_settlement<'a>(&'a self, session_id: &'a str, consumer: &'a str, provider: &'a str, total_msat: u64, gateway_msat: u64, provider_msat: u64, outcome: &'a str) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let doc = SettlementDoc {
+                session_id: session_id.to_string(),
+                consumer: consumer.to_string(),
+                provider: provider.to_string(),
+                total_msat,
+                gateway_msat,
+                provider_msat,
+                outcome: outcome.to_string(),
+                ts,
+            };
+
+            self.settlements.lock().unwrap().insert(session_id.to_string(), doc);
+            Ok(())
+        })
+    }
+
+    fn register_provider(&self, provider: ProviderConnection) -> StoreResult<'_, ()> {
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let principal = provider.principal.clone();
+            self.providers.lock().unwrap().insert(principal, InMemoryProvider {
+                provider,
+                last_seen: ts,
+            });
+            Ok(())
+        })
+    }
+
+    fn update_provider_heartbeat<'a>(&'a self, principal: &'a str) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let mut providers = self.providers.lock().unwrap();
+            if let Some(entry) = providers.get_mut(principal) {
+                entry.last_seen = ts;
+            }
+            Ok(())
+        })
+    }
+
+    fn get_provider<'a>(&'a self, principal: &'a str) -> StoreResult<'a, Option<ProviderConnection>> {
+        Box::pin(async move {
+            let providers = self.providers.lock().unwrap();
+            Ok(providers.get(principal).map(|p| p.provider.clone()))
+        })
+    }
+
+    fn find_provider_by_handle<'a>(&'a self, handle: &'a str) -> StoreResult<'a, Option<ProviderConnection>> {
+        Box::pin(async move {
+            let providers = self.providers.lock().unwrap();
+            let found = providers.values()
+                .find(|p| provider_handle(&p.provider.principal) == handle)
+                .map(|p| p.provider.clone());
+            Ok(found)
+        })
+    }
+
+    fn get_active_providers(&self) -> StoreResult<'_, Vec<ProviderConnection>> {
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let threshold = now.saturating_sub(90);
+
+            let providers = self.providers.lock().unwrap();
+            let list: Vec<ProviderConnection> = providers.values()
+                .filter(|p| p.last_seen >= threshold)
+                .map(|p| p.provider.clone())
+                .collect();
+            Ok(list)
+        })
+    }
+
+    fn remove_provider<'a>(&'a self, principal: &'a str) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            self.providers.lock().unwrap().remove(principal);
+            Ok(())
+        })
+    }
+
+    fn add_rating(&self, rating: serde_json::Value) -> StoreResult<'_, ()> {
+        Box::pin(async move {
+            self.ratings.lock().unwrap().push(rating);
+            Ok(())
+        })
+    }
+
+    fn get_reputation<'a>(&'a self, principal: &'a str) -> StoreResult<'a, ReputationResponse> {
+        Box::pin(async move {
+            let ratings_list = self.ratings.lock().unwrap();
+            let mut matching_ratings = Vec::new();
+            let mut sum_score_weight = 0.0;
+            let mut sum_weight = 0.0;
+
+            for r in ratings_list.iter() {
+                if let Some(subject) = r.get("subject").and_then(|v| v.as_str()) {
+                    if subject == principal {
+                        matching_ratings.push(r.clone());
+                        let score = r.get("score").and_then(|v| v.as_f64()).unwrap_or(0.0);
+                        let settled_msat = r.get("settled_msat").and_then(|v| v.as_u64()).unwrap_or(0);
+                        if settled_msat > 0 {
+                            sum_score_weight += score * (settled_msat as f64);
+                            sum_weight += settled_msat as f64;
+                        }
+                    }
+                }
+            }
+
+            let average_score = if sum_weight > 0.0 {
+                sum_score_weight / sum_weight
+            } else {
+                0.0
+            };
+
+            let settlements = self.settlements.lock().unwrap();
+            let mut total_settled_msat = 0;
+            for s in settlements.values() {
+                if s.provider == principal {
+                    total_settled_msat += s.total_msat;
+                }
+            }
+
+            Ok(ReputationResponse {
+                ratings: matching_ratings,
+                average_score,
+                total_settled_msat,
+            })
+        })
+    }
+
+    fn upload_receipt<'a>(&'a self, session_id: &'a str, data: &'a [u8]) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            self.gcs_blobs.lock().unwrap().insert(format!("receipts/{}.json", session_id), data.to_vec());
+            Ok(())
+        })
+    }
+
+    fn upload_attestation<'a>(&'a self, rating_id: &'a str, data: &'a [u8]) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            self.gcs_blobs.lock().unwrap().insert(format!("attestations/{}.json", rating_id), data.to_vec());
+            Ok(())
+        })
+    }
+}
+
+pub struct CloudStore {
+    pub db: firestore::FirestoreDb,
+    pub gcs: google_cloud_storage::client::Client,
+    pub bucket: String,
+}
+
+impl CloudStore {
+    pub fn new(db: firestore::FirestoreDb, gcs: google_cloud_storage::client::Client, bucket: String) -> Self {
+        Self { db, gcs, bucket }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ProviderHeartbeatUpdate {
+    last_seen: u64,
+}
+
+impl Store for CloudStore {
+    fn get_balance<'a>(&'a self, principal: &'a str) -> StoreResult<'a, u64> {
+        Box::pin(async move {
+            let doc_opt: Option<WalletDoc> = self.db.fluent()
+                .select()
+                .by_id_in("wallets")
+                .obj()
+                .one(principal)
+                .await?;
+            Ok(doc_opt.map(|d| d.balance_msat).unwrap_or(10_000_000_000))
+        })
+    }
+
+    fn record_wallet_event<'a>(&'a self, principal: &'a str, kind: &'a str, amount_msat: i64, status: &'a str) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            let old_balance = self.get_balance(principal).await?;
+            let new_balance = if amount_msat >= 0 {
+                old_balance.saturating_add(amount_msat as u64)
+            } else {
+                old_balance.saturating_sub(amount_msat.unsigned_abs())
+            };
+
+            self.db.fluent()
+                .insert()
+                .into("wallets")
+                .document_id(principal)
+                .object(&WalletDoc { balance_msat: new_balance })
+                .execute::<()>()
+                .await?;
+
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let entry = WalletEntry {
+                ts,
+                r#type: kind.to_string(),
+                amount_msat,
+                status: status.to_string(),
+            };
+
+            let entry_id = format!("{}_{}", ts, uuid::Uuid::new_v4());
+            self.db.fluent()
+                .insert()
+                .into(format!("wallets/{}/history", principal).as_str())
+                .document_id(&entry_id)
+                .object(&entry)
+                .execute::<()>()
+                .await?;
+
+            Ok(())
+        })
+    }
+
+    fn get_wallet_history<'a>(&'a self, principal: &'a str) -> StoreResult<'a, Vec<WalletEntry>> {
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let cutoff = now.saturating_sub(14 * 24 * 60 * 60);
+
+            let list: Vec<WalletEntry> = self.db.fluent()
+                .select()
+                .from(format!("wallets/{}/history", principal).as_str())
+                .filter(|q| q.field("ts").greater_than_or_equal(cutoff))
+                .obj()
+                .query()
+                .await?;
+            Ok(list)
+        })
+    }
+
+    fn record_settlement<'a>(&'a self, session_id: &'a str, consumer: &'a str, provider: &'a str, total_msat: u64, gateway_msat: u64, provider_msat: u64, outcome: &'a str) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let doc = SettlementDoc {
+                session_id: session_id.to_string(),
+                consumer: consumer.to_string(),
+                provider: provider.to_string(),
+                total_msat,
+                gateway_msat,
+                provider_msat,
+                outcome: outcome.to_string(),
+                ts,
+            };
+
+            self.db.fluent()
+                .insert()
+                .into("settlements")
+                .document_id(session_id)
+                .object(&doc)
+                .execute::<()>()
+                .await?;
+
+            Ok(())
+        })
+    }
+
+    fn register_provider(&self, provider: ProviderConnection) -> StoreResult<'_, ()> {
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let principal = provider.principal.clone();
+            let handle = provider_handle(&principal);
+            let doc = ProviderDoc {
+                principal,
+                handle,
+                models: provider.models,
+                keybind: provider.keybind,
+                payout: provider.payout,
+                connection_id: provider.connection_id.to_string(),
+                last_seen: ts,
+            };
+
+            self.db.fluent()
+                .insert()
+                .into("providers")
+                .document_id(&doc.principal)
+                .object(&doc)
+                .execute::<()>()
+                .await?;
+
+            Ok(())
+        })
+    }
+
+    fn update_provider_heartbeat<'a>(&'a self, principal: &'a str) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let ts = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            self.db.fluent()
+                .update()
+                .fields(paths!(ProviderDoc::last_seen))
+                .in_col("providers")
+                .document_id(principal)
+                .object(&ProviderHeartbeatUpdate { last_seen: ts })
+                .execute::<()>()
+                .await?;
+
+            Ok(())
+        })
+    }
+
+    fn get_provider<'a>(&'a self, principal: &'a str) -> StoreResult<'a, Option<ProviderConnection>> {
+        Box::pin(async move {
+            let doc_opt: Option<ProviderDoc> = self.db.fluent()
+                .select()
+                .by_id_in("providers")
+                .obj()
+                .one(principal)
+                .await?;
+
+            if let Some(doc) = doc_opt {
+                let conn_id = uuid::Uuid::parse_str(&doc.connection_id).unwrap_or_default();
+                Ok(Some(ProviderConnection {
+                    principal: doc.principal,
+                    models: doc.models,
+                    keybind: doc.keybind,
+                    payout: doc.payout,
+                    connection_id: conn_id,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn find_provider_by_handle<'a>(&'a self, handle: &'a str) -> StoreResult<'a, Option<ProviderConnection>> {
+        Box::pin(async move {
+            let list: Vec<ProviderDoc> = self.db.fluent()
+                .select()
+                .from("providers")
+                .filter(|q| q.field("handle").equal(handle))
+                .obj()
+                .query()
+                .await?;
+
+            if let Some(doc) = list.into_iter().next() {
+                let conn_id = uuid::Uuid::parse_str(&doc.connection_id).unwrap_or_default();
+                Ok(Some(ProviderConnection {
+                    principal: doc.principal,
+                    models: doc.models,
+                    keybind: doc.keybind,
+                    payout: doc.payout,
+                    connection_id: conn_id,
+                }))
+            } else {
+                Ok(None)
+            }
+        })
+    }
+
+    fn get_active_providers(&self) -> StoreResult<'_, Vec<ProviderConnection>> {
+        Box::pin(async move {
+            use std::time::{SystemTime, UNIX_EPOCH};
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let threshold = now.saturating_sub(90);
+
+            let list: Vec<ProviderDoc> = self.db.fluent()
+                .select()
+                .from("providers")
+                .filter(|q| q.field("last_seen").greater_than_or_equal(threshold))
+                .obj()
+                .query()
+                .await?;
+
+            let result = list.into_iter()
+                .map(|doc| {
+                    let conn_id = uuid::Uuid::parse_str(&doc.connection_id).unwrap_or_default();
+                    ProviderConnection {
+                        principal: doc.principal,
+                        models: doc.models,
+                        keybind: doc.keybind,
+                        payout: doc.payout,
+                        connection_id: conn_id,
+                    }
+                })
+                .collect();
+            Ok(result)
+        })
+    }
+
+    fn remove_provider<'a>(&'a self, principal: &'a str) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            self.db.fluent()
+                .delete()
+                .from("providers")
+                .document_id(principal)
+                .execute()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn add_rating(&self, rating: serde_json::Value) -> StoreResult<'_, ()> {
+        Box::pin(async move {
+            let session_id = rating.get("session_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let rating_id = if session_id.is_empty() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                session_id.clone()
+            };
+
+            let provider = rating.get("subject").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let rater = rating.get("rater").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let score = rating.get("score").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+            let settled_msat = rating.get("settled_msat").and_then(|v| v.as_u64()).unwrap_or(0);
+            let ts = rating.get("ts").and_then(|v| v.as_u64()).unwrap_or_default();
+
+            let doc = RatingDoc {
+                rating_id: rating_id.clone(),
+                provider,
+                rater,
+                session_id,
+                score,
+                settled_msat,
+                rating_json: rating.to_string(),
+                ts,
+            };
+
+            self.db.fluent()
+                .insert()
+                .into("ratings")
+                .document_id(&rating_id)
+                .object(&doc)
+                .execute::<()>()
+                .await?;
+            Ok(())
+        })
+    }
+
+    fn get_reputation<'a>(&'a self, principal: &'a str) -> StoreResult<'a, ReputationResponse> {
+        Box::pin(async move {
+            let list: Vec<RatingDoc> = self.db.fluent()
+                .select()
+                .from("ratings")
+                .filter(|q| q.field("provider").equal(principal))
+                .obj()
+                .query()
+                .await?;
+
+            let mut ratings = Vec::new();
+            let mut sum_score_weight = 0.0;
+            let mut sum_weight = 0.0;
+
+            for doc in list {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&doc.rating_json) {
+                    ratings.push(val);
+                }
+                if doc.settled_msat > 0 {
+                    sum_score_weight += (doc.score as f64) * (doc.settled_msat as f64);
+                    sum_weight += doc.settled_msat as f64;
+                }
+            }
+
+            let average_score = if sum_weight > 0.0 {
+                sum_score_weight / sum_weight
+            } else {
+                0.0
+            };
+
+            let settlements: Vec<SettlementDoc> = self.db.fluent()
+                .select()
+                .from("settlements")
+                .filter(|q| q.field("provider").equal(principal))
+                .obj()
+                .query()
+                .await?;
+
+            let total_settled_msat = settlements.iter().map(|s| s.total_msat).sum();
+
+            Ok(ReputationResponse {
+                ratings,
+                average_score,
+                total_settled_msat,
+            })
+        })
+    }
+
+    fn upload_receipt<'a>(&'a self, session_id: &'a str, data: &'a [u8]) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
+            let object_name = format!("receipts/{}.json", session_id);
+            let upload_type = UploadType::Simple(Media::new(object_name));
+            let request = UploadObjectRequest {
+                bucket: self.bucket.clone(),
+                ..Default::default()
+            };
+            self.gcs.upload_object(&request, data.to_vec(), &upload_type).await?;
+            Ok(())
+        })
+    }
+
+    fn upload_attestation<'a>(&'a self, rating_id: &'a str, data: &'a [u8]) -> StoreResult<'a, ()> {
+        Box::pin(async move {
+            use google_cloud_storage::http::objects::upload::{Media, UploadObjectRequest, UploadType};
+            let object_name = format!("attestations/{}.json", rating_id);
+            let upload_type = UploadType::Simple(Media::new(object_name));
+            let request = UploadObjectRequest {
+                bucket: self.bucket.clone(),
+                ..Default::default()
+            };
+            self.gcs.upload_object(&request, data.to_vec(), &upload_type).await?;
+            Ok(())
+        })
+    }
+}
+
+pub async fn detect_store() -> Arc<dyn Store> {
+    let project_id = std::env::var("GOOGLE_CLOUD_PROJECT").unwrap_or_else(|_| "gnosis-459403".to_string());
+    let bucket_opt = std::env::var("CHARON_GCS_BUCKET").ok();
+    
+    if let Some(bucket) = bucket_opt {
+        match google_cloud_storage::client::ClientConfig::default().with_auth().await {
+            Ok(gcs_config) => {
+                let gcs_client = google_cloud_storage::client::Client::new(gcs_config);
+                match FirestoreDb::new(&project_id).await {
+                    Ok(firestore_db) => {
+                        tracing::info!("Successfully initialized Google Cloud Store (Firestore project={}, GCS bucket={})", project_id, bucket);
+                        return Arc::new(CloudStore::new(firestore_db, gcs_client, bucket));
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to initialize Firestore client: {:?}. Falling back to InMemoryStore.", e);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to initialize GCS ClientConfig with auth: {:?}. Falling back to InMemoryStore.", e);
+            }
+        }
+    } else {
+        tracing::info!("CHARON_GCS_BUCKET not set. Using InMemoryStore.");
+    }
+    
+    Arc::new(InMemoryStore::new())
+}
+
 pub struct GatewayState {
-    pub providers: Mutex<HashMap<String, ProviderConnection>>,
+    pub store: Arc<dyn Store>,
     pub sessions: Mutex<HashMap<String, SessionInfo>>,
     pub principal_sessions: Mutex<HashMap<String, HashSet<String>>>,
     pub connections: Mutex<HashMap<Uuid, ConnectionInfo>>,
     pub rate_limits: Mutex<HashMap<String, Vec<tokio::time::Instant>>>,
-    pub wallets: Mutex<HashMap<String, UserWallet>>,
     pub authenticator: Arc<dyn Authenticator>,
     pub payment_verifier: Arc<dyn PaymentVerifier>,
     pub disable_auth: bool,
@@ -252,6 +980,7 @@ pub struct GatewayState {
 
 impl GatewayState {
     pub fn new(
+        store: Arc<dyn Store>,
         authenticator: Arc<dyn Authenticator>,
         payment_verifier: Arc<dyn PaymentVerifier>,
         disable_auth: bool,
@@ -259,12 +988,11 @@ impl GatewayState {
         floor_msat: u64,
     ) -> Self {
         Self {
-            providers: Mutex::new(HashMap::new()),
+            store,
             sessions: Mutex::new(HashMap::new()),
             principal_sessions: Mutex::new(HashMap::new()),
             connections: Mutex::new(HashMap::new()),
             rate_limits: Mutex::new(HashMap::new()),
-            wallets: Mutex::new(HashMap::new()),
             authenticator,
             payment_verifier,
             disable_auth,
@@ -273,34 +1001,10 @@ impl GatewayState {
         }
     }
 
-    pub fn record_wallet_event(&self, principal: &str, kind: &str, amount_msat: i64, status: &str) {
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let entry = WalletEntry {
-            ts,
-            r#type: kind.to_string(),
-            amount_msat,
-            status: status.to_string(),
-        };
-
-        let mut wallets = self.wallets.lock().unwrap();
-        let wallet = wallets.entry(principal.to_string()).or_insert_with(|| UserWallet {
-            balance_msat: 10_000_000_000,
-            history: Vec::new(),
-        });
-
-        if amount_msat >= 0 {
-            wallet.balance_msat = wallet.balance_msat.saturating_add(amount_msat as u64);
-        } else {
-            let amount_abs = amount_msat.unsigned_abs();
-            wallet.balance_msat = wallet.balance_msat.saturating_sub(amount_abs);
+    pub async fn record_wallet_event(&self, principal: &str, kind: &str, amount_msat: i64, status: &str) {
+        if let Err(e) = self.store.record_wallet_event(principal, kind, amount_msat, status).await {
+            tracing::error!("Failed to record wallet event: {:?}", e);
         }
-
-        wallet.history.push(entry);
     }
 
     pub fn check_ip_connect_rate_limit(&self, ip: IpAddr) -> bool {
@@ -359,17 +1063,16 @@ impl GatewayState {
         }
     }
 
-    pub fn remove_connection(&self, id: Uuid) {
+    pub async fn remove_connection(&self, id: Uuid) {
         let principal_opt = {
             let mut connections = self.connections.lock().unwrap();
             connections.remove(&id).and_then(|c| c.principal)
         };
 
         if let Some(ref principal) = principal_opt {
-            let mut providers = self.providers.lock().unwrap();
-            if let Some(p) = providers.get(principal) {
+            if let Ok(Some(p)) = self.store.get_provider(principal).await {
                 if p.connection_id == id {
-                    providers.remove(principal);
+                    let _ = self.store.remove_provider(principal).await;
                 }
             }
         }
@@ -389,36 +1092,34 @@ impl GatewayState {
         }
     }
 
-    pub fn register_provider(&self, principal: String, models: Vec<ModelCard>, keybind: Keybind, payout: Payout, connection_id: Uuid) {
+    pub async fn register_provider(&self, principal: String, models: Vec<ModelCard>, keybind: Keybind, payout: Payout, connection_id: Uuid) -> anyhow::Result<()> {
         let old_conn_id = {
-            let mut providers = self.providers.lock().unwrap();
-            providers.insert(principal.clone(), ProviderConnection {
-                principal,
-                models,
-                keybind,
-                payout,
-                connection_id,
-            }).map(|p| p.connection_id)
+            let old_p = self.store.get_provider(&principal).await?;
+            old_p.map(|p| p.connection_id)
         };
+
+        self.store.register_provider(ProviderConnection {
+            principal,
+            models,
+            keybind,
+            payout,
+            connection_id,
+        }).await?;
 
         if let Some(old_id) = old_conn_id {
             if old_id != connection_id {
-                self.remove_connection(old_id);
+                self.remove_connection(old_id).await;
             }
         }
+        Ok(())
     }
 
-    pub fn get_provider(&self, principal: &str) -> Option<ProviderConnection> {
-        let providers = self.providers.lock().unwrap();
-        providers.get(principal).cloned()
+    pub async fn get_provider(&self, principal: &str) -> Option<ProviderConnection> {
+        self.store.get_provider(principal).await.ok().flatten()
     }
 
-    pub fn find_provider_by_handle(&self, handle: &str) -> Option<ProviderConnection> {
-        let providers = self.providers.lock().unwrap();
-        providers
-            .values()
-            .find(|p| provider_handle(&p.principal) == handle)
-            .cloned()
+    pub async fn find_provider_by_handle(&self, handle: &str) -> Option<ProviderConnection> {
+        self.store.find_provider_by_handle(handle).await.ok().flatten()
     }
 
     pub fn add_session(&self, session: SessionInfo) {
@@ -522,12 +1223,12 @@ pub async fn get_directory(
     axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
     _principal: HttpPrincipal,
 ) -> axum::Json<Vec<DirectoryEntry>> {
-    let providers = state.providers.lock().unwrap();
-    let entries: Vec<DirectoryEntry> = providers
-        .values()
+    let active_providers = state.store.get_active_providers().await.unwrap_or_default();
+    let entries: Vec<DirectoryEntry> = active_providers
+        .into_iter()
         .map(|p| DirectoryEntry {
             principal: provider_handle(&p.principal),
-            models: p.models.clone(),
+            models: p.models,
         })
         .collect();
     axum::Json(entries)
@@ -541,16 +1242,23 @@ pub struct ReputationResponse {
 }
 
 pub async fn get_reputation(
-    axum::extract::State(_state): axum::extract::State<Arc<GatewayState>>,
+    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
     axum::extract::Path(principal): axum::extract::Path<String>,
     _principal: HttpPrincipal,
-) -> axum::Json<ReputationResponse> {
-    tracing::info!(%principal, "Fetching reputation for provider");
-    axum::Json(ReputationResponse {
-        ratings: vec![],
-        average_score: 0.0,
-        total_settled_msat: 0,
-    })
+) -> Result<axum::Json<ReputationResponse>, (StatusCode, String)> {
+    let real_principal = if principal.starts_with("charon:") {
+        match state.store.find_provider_by_handle(&principal).await {
+            Ok(Some(p)) => p.principal,
+            _ => return Err((StatusCode::NOT_FOUND, "Provider not found".to_string())),
+        }
+    } else {
+        principal
+    };
+
+    match state.store.get_reputation(&real_principal).await {
+        Ok(rep) => Ok(axum::Json(rep)),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get reputation: {:?}", e))),
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -572,9 +1280,9 @@ pub async fn post_quote(
     _principal: HttpPrincipal,
     axum::Json(req): axum::Json<QuoteRequest>,
 ) -> Result<axum::Json<QuoteResponse>, (StatusCode, String)> {
-    let providers = state.providers.lock().unwrap();
+    let providers = state.store.get_active_providers().await.unwrap_or_default();
     let mut rate_opt = None;
-    for p in providers.values() {
+    for p in providers {
         if let Some(m) = p.models.iter().find(|m| m.name == req.model) {
             rate_opt = Some(Rate {
                 price_msat_per_mtok_in: m.price_msat_per_mtok_in,
@@ -620,15 +1328,11 @@ pub struct BalanceResponse {
 pub async fn wallet_balance(
     axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
     principal: HttpPrincipal,
-) -> axum::Json<BalanceResponse> {
-    let mut wallets = state.wallets.lock().unwrap();
-    let wallet = wallets.entry(principal.0.clone()).or_insert_with(|| UserWallet {
-        balance_msat: 10_000_000_000,
-        history: Vec::new(),
-    });
-    axum::Json(BalanceResponse {
-        balance_msat: wallet.balance_msat,
-    })
+) -> Result<axum::Json<BalanceResponse>, (StatusCode, String)> {
+    match state.store.get_balance(&principal.0).await {
+        Ok(balance_msat) => Ok(axum::Json(BalanceResponse { balance_msat })),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get balance: {:?}", e))),
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -639,31 +1343,35 @@ pub struct HistoryResponse {
 pub async fn wallet_history(
     axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
     principal: HttpPrincipal,
-) -> axum::Json<HistoryResponse> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let cutoff = now.saturating_sub(14 * 24 * 60 * 60);
-
-    let mut wallets = state.wallets.lock().unwrap();
-    let wallet = wallets.entry(principal.0.clone()).or_insert_with(|| UserWallet {
-        balance_msat: 10_000_000_000,
-        history: Vec::new(),
-    });
-
-    wallet.history.retain(|e| e.ts >= cutoff);
-
-    axum::Json(HistoryResponse {
-        entries: wallet.history.clone(),
-    })
+) -> Result<axum::Json<HistoryResponse>, (StatusCode, String)> {
+    match state.store.get_wallet_history(&principal.0).await {
+        Ok(entries) => Ok(axum::Json(HistoryResponse { entries })),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to get history: {:?}", e))),
+    }
 }
 
 pub async fn post_ratings(
+    axum::extract::State(state): axum::extract::State<Arc<GatewayState>>,
     _principal: HttpPrincipal,
-) -> (StatusCode, &'static str) {
-    (StatusCode::NOT_IMPLEMENTED, "TODO: POST /v1/ratings (spec 12)")
+    axum::Json(rating): axum::Json<serde_json::Value>,
+) -> Result<StatusCode, (StatusCode, String)> {
+    let session_id = rating.get("session_id").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    if session_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, "Missing session_id".to_string()));
+    }
+    
+    let rating_id = session_id.clone();
+    
+    let data = serde_json::to_vec(&rating).map_err(|e| (StatusCode::BAD_REQUEST, e.to_string()))?;
+    if let Err(e) = state.store.upload_attestation(&rating_id, &data).await {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to upload attestation to GCS: {:?}", e)));
+    }
+    
+    if let Err(e) = state.store.add_rating(rating).await {
+        return Err((StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to save rating to Firestore: {:?}", e)));
+    }
+    
+    Ok(StatusCode::OK)
 }
 
 pub async fn ws_handler(
@@ -775,6 +1483,11 @@ async fn handle_ws_socket(
                     if let Err(_) = tx_clone.send(Frame::Ping) {
                         break;
                     }
+                    if let Some(conn) = reader_state.get_connection(reader_conn_id) {
+                        if let Some(ref principal) = conn.principal {
+                            let _ = reader_state.store.update_provider_heartbeat(principal).await;
+                        }
+                    }
                 }
                 msg_opt = ws_receiver.next() => {
                     match msg_opt {
@@ -824,7 +1537,7 @@ async fn handle_ws_socket(
     }
     
     tracing::info!(%connection_id, "Cleaning up connection");
-    state.remove_connection(connection_id);
+    state.remove_connection(connection_id).await;
 }
 
 async fn process_frame(
@@ -855,13 +1568,13 @@ async fn process_frame(
                         return Ok(());
                     }
                     
-                    state.register_provider(
+                    let _ = state.register_provider(
                         principal.clone(),
                         models,
                         keybind,
                         payout,
                         connection_id,
-                    );
+                    ).await;
                     
                     state.update_connection_principal(connection_id, Some(principal.clone()));
                     let _ = tx.send(Frame::Registered { provider: principal });
@@ -934,9 +1647,9 @@ async fn process_frame(
                 return Ok(());
             }
             
-            let provider = match state.get_provider(&envelope.provider) {
+            let provider = match state.get_provider(&envelope.provider).await {
                 Some(p) => Some(p),
-                None => state.find_provider_by_handle(&envelope.provider),
+                None => state.find_provider_by_handle(&envelope.provider).await,
             };
             
             let provider = match provider {
@@ -1014,11 +1727,11 @@ async fn process_frame(
             };
             
             state.add_session(session_info);
-
+ 
             // Record Cashu settlement split (gateway keeps gateway_msat, provider credited provider_msat)
             // TODO: Provider P2PK payout + change/refund are follow-ups.
-            state.record_wallet_event("gateway", "cashu_fee", quote.gateway_msat as i64, "settled");
-            state.record_wallet_event(&provider.principal, "cashu_credit", quote.provider_msat as i64, "settled");
+            state.record_wallet_event("gateway", "cashu_fee", quote.gateway_msat as i64, "settled").await;
+            state.record_wallet_event(&provider.principal, "cashu_credit", quote.provider_msat as i64, "settled").await;
             
             let _ = tx.send(Frame::OpenOk {
                 session_id: session_id.clone(),
@@ -1108,9 +1821,33 @@ async fn process_frame(
                 let _ = cc.sender.send(settled_frame);
             }
 
-            state.record_wallet_event(&session.consumer_principal, "settlement", -(session.total_msat as i64), "settled");
-            state.record_wallet_event(&session.provider_principal, "settlement", session.provider_msat as i64, "settled");
+            state.record_wallet_event(&session.consumer_principal, "settlement", -(session.total_msat as i64), "settled").await;
+            state.record_wallet_event(&session.provider_principal, "settlement", session.provider_msat as i64, "settled").await;
             
+            let _ = state.store.record_settlement(
+                &session_id,
+                &session.consumer_principal,
+                &session.provider_principal,
+                session.total_msat,
+                session.gateway_msat,
+                session.provider_msat,
+                "ok",
+            ).await;
+
+            let receipt = serde_json::json!({
+                "session_id": session_id.clone(),
+                "consumer": session.consumer_principal.clone(),
+                "provider": session.provider_principal.clone(),
+                "total_msat": session.total_msat,
+                "gateway_msat": session.gateway_msat,
+                "provider_msat": session.provider_msat,
+                "outcome": "ok",
+                "ts": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs(),
+            });
+            if let Ok(receipt_bytes) = serde_json::to_vec(&receipt) {
+                let _ = state.store.upload_receipt(&session_id, &receipt_bytes).await;
+            }
+
             state.remove_session(&session_id);
             Ok(())
         }
@@ -1327,7 +2064,8 @@ mod tests {
         // 2. Setup gateway state
         let auth = Arc::new(GnosisAuthenticator::new("http://auth".to_string(), true));
         let verifier = Arc::new(DevPaymentVerifier);
-        let state = Arc::new(GatewayState::new(auth, verifier, true, 0, 0));
+        let store = Arc::new(InMemoryStore::new());
+        let state = Arc::new(GatewayState::new(store, auth, verifier, true, 0, 0));
 
         let models = vec![ModelCard {
             name: "test-model".to_string(),
@@ -1347,15 +2085,15 @@ mod tests {
         };
         let connection_id = Uuid::new_v4();
 
-        state.register_provider(email.to_string(), models, keybind, payout, connection_id);
+        let _ = state.register_provider(email.to_string(), models, keybind, payout, connection_id).await;
 
         // 3. Verify handle resolution
-        let resolved = state.find_provider_by_handle(&handle);
+        let resolved = state.find_provider_by_handle(&handle).await;
         assert!(resolved.is_some());
         assert_eq!(resolved.unwrap().principal, email);
 
         // 4. Verify raw principal still works
-        let resolved_raw = state.get_provider(email);
+        let resolved_raw = state.get_provider(email).await;
         assert!(resolved_raw.is_some());
         assert_eq!(resolved_raw.unwrap().principal, email);
 
