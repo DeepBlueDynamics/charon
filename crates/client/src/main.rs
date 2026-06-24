@@ -420,7 +420,10 @@ async fn mint_cashu_token(mint_url_str: &str, amount_msat: u64) -> anyhow::Resul
     use cdk::nuts::{CurrencyUnit, PaymentMethod, nut00::KnownMethod, nut00::Token};
     use cdk::mint_url::MintUrl;
 
-    let total_sats = ((amount_msat + 999) / 1000).max(1);
+    // Mint a small buffer above the price (2% + 2 sat) so the gateway's redeem
+    // swap fee at the mint doesn't leave the net below the price -> Underpaid.
+    let base_sats = ((amount_msat + 999) / 1000).max(1);
+    let total_sats = base_sats + base_sats / 50 + 2;
     
     // Create ephemeral db
     let localstore = cdk_sqlite::wallet::memory::empty().await
