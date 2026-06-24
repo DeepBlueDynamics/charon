@@ -9,6 +9,7 @@ use charon_gateway::{GatewayState, GnosisAuthenticator, DevPaymentVerifier, run_
 
 #[tokio::test]
 async fn test_relay_flow_and_injection_prevention() {
+    std::env::set_var("DISABLE_KEYBIND_VERIFY", "true");
     // 1. Bind and start the gateway server in-process on a random port
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -24,6 +25,7 @@ async fn test_relay_flow_and_injection_prevention() {
         true, // disable_auth
         1000, // markup_bps
         21000, // floor_msat
+        "".to_string(),
     ));
     
     let state_clone = state.clone();
@@ -204,6 +206,7 @@ async fn test_relay_flow_and_injection_prevention() {
 
 #[tokio::test]
 async fn test_non_dev_mode_consumer_verification() {
+    std::env::set_var("DISABLE_KEYBIND_VERIFY", "true");
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let port = addr.port();
@@ -234,6 +237,7 @@ async fn test_non_dev_mode_consumer_verification() {
         false, // disable_auth = false (non-dev mode)
         1000,
         21000,
+        "".to_string(),
     ));
 
     let state_clone = state.clone();
@@ -366,6 +370,7 @@ async fn test_non_dev_mode_consumer_verification() {
 
 #[tokio::test]
 async fn test_cors_preflight_and_origins() {
+    std::env::set_var("DISABLE_KEYBIND_VERIFY", "true");
     // Set custom CORS origins env var for testing
     std::env::set_var("CHARON_CORS_ORIGINS", "https://test-dashboard.charon.nuts.services,http://localhost:12345");
 
@@ -383,6 +388,7 @@ async fn test_cors_preflight_and_origins() {
         true, // disable_auth
         1000,
         21000,
+        "".to_string(),
     ));
 
     let state_clone = state.clone();
@@ -502,6 +508,7 @@ async fn test_wallet_history_retention_and_isolation() {
         false, // disable_auth = false
         1000,
         21000,
+        "".to_string(),
     ));
 
     let state_clone = state.clone();

@@ -72,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
         args.disable_auth,
         args.markup_bps,
         args.floor_msat,
+        args.auth_url.clone(),
     ));
 
     let listener = TcpListener::bind(&args.bind).await?;

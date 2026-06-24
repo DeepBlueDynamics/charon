@@ -64,6 +64,9 @@ enum Role {
         /// Output directory (writes x25519.key and keybind.json).
         #[arg(long, default_value = ".")]
         out: String,
+        /// Principal to bind (defaults to dev principal if omitted)
+        #[arg(long, env = "CHARON_PRINCIPAL")]
+        principal: Option<String>,
     },
 }
 
@@ -76,18 +79,81 @@ async fn main() -> anyhow::Result<()> {
     match cli.role {
         Role::Consumer { listen } => run_consumer(listen, cli.gateway, cli.ahp_token, cli.cashu_mint).await,
         Role::Provider { config, ollama } => run_provider(config, ollama, cli.gateway, cli.ahp_token).await,
-        Role::Keygen { out } => run_keygen(out),
+        Role::Keygen { out, principal } => run_keygen(out, principal),
     }
 }
 
-fn run_keygen(out: String) -> anyhow::Result<()> {
+fn run_keygen(out: String, principal: Option<String>) -> anyhow::Result<()> {
+    // Generate or load Nostr keypair
+    let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/opt/nemesis8".to_string());
+    let charon_dir = std::path::PathBuf::from(&home_dir).join(".charon");
+    std::fs::create_dir_all(&charon_dir)?;
+    let nostr_key_path = charon_dir.join("nostr.key");
+
+    let secp = secp256k1::Secp256k1::new();
+    let (nostr_secret, xonly_pub_bytes) = if nostr_key_path.exists() {
+        let hex_str = std::fs::read_to_string(&nostr_key_path)?;
+        let trimmed = hex_str.trim();
+        let bytes = hex::decode(trimmed).context("Invalid hex in ~/.charon/nostr.key")?;
+        if bytes.len() != 32 {
+            return Err(anyhow::anyhow!("~/.charon/nostr.key must be 32 bytes"));
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&bytes);
+        let sk = secp256k1::SecretKey::from_slice(&secret)?;
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let (xpub, _) = kp.x_only_public_key();
+        (secret, xpub.serialize())
+    } else {
+        let mut priv_bytes = [0u8; 32];
+        loop {
+            for chunk in priv_bytes.chunks_mut(16) {
+                chunk.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+            }
+            if secp256k1::SecretKey::from_slice(&priv_bytes).is_ok() {
+                break;
+            }
+        }
+        let sk = secp256k1::SecretKey::from_slice(&priv_bytes)?;
+        let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+        let (xpub, _) = kp.x_only_public_key();
+        let hex_str = hex::encode(priv_bytes);
+        
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            let mut options = std::fs::OpenOptions::new();
+            options.create(true).write(true).truncate(true).mode(0o600);
+            let mut file = options.open(&nostr_key_path)?;
+            use std::io::Write;
+            file.write_all(hex_str.as_bytes())?;
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::write(&nostr_key_path, hex_str.as_bytes())?;
+        }
+        println!("Generated new Nostr key at {}", nostr_key_path.display());
+        (priv_bytes, xpub.serialize())
+    };
+
+    // Print npub as both bech32 and hex
+    let hrp = bech32::Hrp::parse("npub")?;
+    let bech32_npub = bech32::encode::<bech32::Bech32>(hrp, &xonly_pub_bytes)?;
+    let hex_npub = hex::encode(xonly_pub_bytes);
+    println!("Nostr Public Key (npub): {}", bech32_npub);
+    println!("Nostr Public Key (hex):  {}", hex_npub);
+
     // Random 32-byte X25519 secret (clamped on use). Derive the public key and
     // write the key file + a keybind the provider/consumer config points at.
     let mut priv_bytes = [0u8; 32];
     for chunk in priv_bytes.chunks_mut(16) {
         chunk.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
     }
-    let keybind = keybind_for_private(&priv_bytes);
+
+    let x25519_pub = public_from_private(&priv_bytes);
+    let principal_str = principal.unwrap_or_else(|| charon_core::auth::NutsAuth::dev_principal().to_string());
+    let keybind = charon_core::crypto::sign_keybind(x25519_pub, &principal_str, 0, nostr_secret);
+
     std::fs::create_dir_all(&out)?;
     let dir = std::path::Path::new(&out);
     let key_path = dir.join("x25519.key");
@@ -101,8 +167,6 @@ fn run_keygen(out: String) -> anyhow::Result<()> {
     println!("  [identity]");
     println!("  x25519_key_file = \"{}\"", key_path.display());
     println!("  keybind_file    = \"{}\"", kb_path.display());
-    println!("\nNote: this keybind carries a dev signature for now. Production keybinds");
-    println!("are signed by your NUTS/Nostr identity so the binding cannot be forged.");
     Ok(())
 }
 
@@ -239,12 +303,32 @@ struct ProviderSession {
 
 async fn run_consumer(listen: String, gateway: String, ahp_token: Option<String>, cashu_mint: String) -> anyhow::Result<()> {
     let static_private = load_consumer_private()?;
-    let keybind = keybind_for_private(&static_private);
     let principal = consumer_principal(ahp_token.as_deref()).await?;
 
     let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/opt/nemesis8".to_string());
     let charon_dir = std::path::PathBuf::from(&home_dir).join(".charon");
     std::fs::create_dir_all(&charon_dir)?;
+
+    let nostr_key_path = charon_dir.join("nostr.key");
+    let nostr_secret = if nostr_key_path.exists() {
+        let hex_str = std::fs::read_to_string(&nostr_key_path)?;
+        let bytes = hex::decode(hex_str.trim())?;
+        if bytes.len() != 32 {
+            return Err(anyhow::anyhow!("Invalid nostr.key length"));
+        }
+        let mut secret = [0u8; 32];
+        secret.copy_from_slice(&bytes);
+        secret
+    } else {
+        let mut temp_secret = [0u8; 32];
+        for chunk in temp_secret.chunks_mut(16) {
+            chunk.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        }
+        temp_secret
+    };
+
+    let x25519_pub = public_from_private(&static_private);
+    let keybind = charon_core::crypto::sign_keybind(x25519_pub, &principal, 0, nostr_secret);
     let db_path = charon_dir.join("wallet.sqlite");
     
     let localstore = cdk_sqlite::WalletSqliteDatabase::new(db_path).await
@@ -353,6 +437,41 @@ async fn run_provider(
             Frame::Deliver { session_id, frame } => match *frame {
                 Frame::Open { envelope, .. } => {
                     tracing::info!(%session_id, model = %envelope.model, "provider received open");
+                    
+                    let disable_keybind_verify = std::env::var("DISABLE_KEYBIND_VERIFY")
+                        .map(|v| v == "true")
+                        .unwrap_or(false);
+                    if !disable_keybind_verify {
+                        let auth_url = std::env::var("GNOSIS_AUTH_URL")
+                            .unwrap_or_else(|_| "https://auth.nuts.services".to_string());
+                        match charon_core::auth::get_principal_nostr_pubkey(&auth_url, &envelope.consumer).await {
+                            Ok(pubkey) => {
+                                if !charon_core::crypto::verify_keybind(&envelope.consumer_keybind, &envelope.consumer, pubkey) {
+                                    tracing::error!(%session_id, consumer = %envelope.consumer, "Consumer keybind verification failed");
+                                    let err_frame = Frame::Error {
+                                        session_id: Some(session_id.clone()),
+                                        code: ErrorCode::KeyUnverified,
+                                        message: "Consumer keybind verification failed".into(),
+                                        http_status: Some(401),
+                                    };
+                                    let _ = send_frame(&mut ws, &err_frame).await;
+                                    continue;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(%session_id, consumer = %envelope.consumer, "Failed to fetch consumer Nostr pubkey: {:?}", e);
+                                let err_frame = Frame::Error {
+                                    session_id: Some(session_id.clone()),
+                                    code: ErrorCode::KeyUnverified,
+                                    message: "Failed to fetch consumer Nostr pubkey".into(),
+                                    http_status: Some(401),
+                                };
+                                let _ = send_frame(&mut ws, &err_frame).await;
+                                continue;
+                            }
+                        }
+                    }
+
                     sessions.insert(session_id, ProviderSession { envelope, session: None });
                 }
                 Frame::Hs { blob, .. } => {
@@ -1104,14 +1223,6 @@ fn load_consumer_private() -> anyhow::Result<[u8; 32]> {
     match std::env::var("CHARON_CONSUMER_X25519_PRIV") {
         Ok(value) => parse_key32(&value),
         Err(_) => Ok([7; 32]),
-    }
-}
-
-fn keybind_for_private(private: &[u8; 32]) -> Keybind {
-    Keybind {
-        x25519_pub: BASE64.encode(public_from_private(private)),
-        sig: "dev-keybind".to_string(),
-        not_after: 0,
     }
 }
 

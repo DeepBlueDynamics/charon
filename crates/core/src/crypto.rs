@@ -72,37 +72,84 @@ pub fn prologue(
 
 /// Verify a [`Keybind`] signature against the named NUTS principal (spec 02).
 /// MUST NOT be forgeable by the gateway. Returns the verified X25519 pubkey bytes.
-pub fn verify_keybind(principal: &str, keybind: &Keybind) -> Result<[u8; 32], CryptoError> {
-    if principal.is_empty() || keybind.sig.is_empty() {
-        return Err(CryptoError::BadKeybind);
-    }
+use secp256k1::{Secp256k1, Message, Keypair, XOnlyPublicKey};
+use secp256k1::hashes::{sha256, Hash};
 
-    if keybind.not_after != 0 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|err| CryptoError::InvalidKey(err.to_string()))?
-            .as_secs();
-        if keybind.not_after < now {
-            return Err(CryptoError::BadKeybind);
+/// Sign a keybind using a Nostr secret key (BIP340 Schnorr signature).
+pub fn sign_keybind(
+    x25519_pub: [u8; 32],
+    principal: &str,
+    not_after: u64,
+    nostr_secret: [u8; 32],
+) -> Keybind {
+    let mut msg_bytes = Vec::new();
+    msg_bytes.extend_from_slice(&x25519_pub);
+    msg_bytes.extend_from_slice(principal.as_bytes());
+    msg_bytes.extend_from_slice(&not_after.to_le_bytes());
+
+    let msg_hash = sha256::Hash::hash(&msg_bytes);
+    let message = Message::from_digest(msg_hash.to_byte_array());
+
+    let secp = Secp256k1::new();
+    let keypair = Keypair::from_seckey_slice(&secp, &nostr_secret)
+        .expect("Invalid Nostr secret key");
+
+    let sig = secp.sign_schnorr_no_aux_rand(&message, &keypair);
+    let sig_hex = format!("{:x}", sig);
+
+    Keybind {
+        x25519_pub: BASE64.encode(x25519_pub),
+        sig: sig_hex,
+        not_after,
+    }
+}
+
+/// Verify a [`Keybind`] signature against the named NUTS principal's Nostr X-only public key.
+pub fn verify_keybind(
+    kb: &Keybind,
+    principal: &str,
+    nostr_xonly_pub: [u8; 32],
+) -> bool {
+    if kb.not_after != 0 {
+        let now = match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => d.as_secs(),
+            Err(_) => return false,
+        };
+        if now > kb.not_after {
+            return false;
         }
     }
 
-    let decoded = BASE64
-        .decode(&keybind.x25519_pub)
-        .map_err(|err| CryptoError::InvalidKey(err.to_string()))?;
-    let x25519_pub: [u8; 32] = decoded
-        .try_into()
-        .map_err(|_| CryptoError::InvalidKey("x25519 public key must be 32 bytes".into()))?;
+    let x25519_pub_bytes = match BASE64.decode(&kb.x25519_pub) {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    if x25519_pub_bytes.len() != 32 {
+        return false;
+    }
+    let mut x25519_pub = [0u8; 32];
+    x25519_pub.copy_from_slice(&x25519_pub_bytes);
 
-    // NUTS has not finalized the signing primitive for the identity binding.
-    // This function deliberately enforces the stable parts now: a named
-    // principal, a non-empty signature, an unexpired binding, and a valid
-    // 32-byte X25519 key. Replace this block with verification of
-    // sign(nuts_identity, x25519_pub || principal || not_after) once the
-    // nuts-auth/identity signature format is specified.
-    let _message = keybind_message(&x25519_pub, principal, keybind.not_after);
+    let mut msg_bytes = Vec::new();
+    msg_bytes.extend_from_slice(&x25519_pub);
+    msg_bytes.extend_from_slice(principal.as_bytes());
+    msg_bytes.extend_from_slice(&kb.not_after.to_le_bytes());
 
-    Ok(x25519_pub)
+    let msg_hash = sha256::Hash::hash(&msg_bytes);
+    let message = Message::from_digest(msg_hash.to_byte_array());
+
+    let pubkey = match XOnlyPublicKey::from_slice(&nostr_xonly_pub) {
+        Ok(pk) => pk,
+        Err(_) => return false,
+    };
+
+    let sig = match kb.sig.parse::<secp256k1::schnorr::Signature>() {
+        Ok(s) => s,
+        Err(_) => return false,
+    };
+
+    let secp = Secp256k1::new();
+    secp.verify_schnorr(&sig, &message, &pubkey).is_ok()
 }
 
 /// A consumer's set of trusted, pinned provider keys (spec 02/08).

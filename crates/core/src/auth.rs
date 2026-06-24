@@ -141,3 +141,53 @@ impl NutsAuth {
         }
     }
 }
+
+/// Fetch a principal's Nostr public key from nuts-auth (spec 02 / option A).
+/// GET {auth_url}/api/identity/{principal}/nostr -> {"nostr_pubkey":"<hex>"}
+///
+/// NOTE: CLEARLY MARKED FOR REPOINTING / CUSTOMIZATION:
+/// If the identity provider location changes, update this URL helper.
+pub async fn get_principal_nostr_pubkey(
+    auth_url: &str,
+    principal: &str,
+) -> Result<[u8; 32], AuthError> {
+    let client = reqwest::Client::new();
+    let url = format!(
+        "{}/api/identity/{}/nostr",
+        auth_url.trim_end_matches('/'),
+        principal
+    );
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| AuthError::Transport(e.to_string()))?;
+    
+    if !resp.status().is_success() {
+        return Err(AuthError::Invalid);
+    }
+
+    #[derive(serde::Deserialize)]
+    struct NostrPubkeyResponse {
+        nostr_pubkey: String,
+    }
+
+    let body: NostrPubkeyResponse = resp
+        .json()
+        .await
+        .map_err(|e| AuthError::Transport(e.to_string()))?;
+
+    // Parse the hex public key
+    let trimmed = body.nostr_pubkey.trim();
+    if trimmed.len() != 64 {
+        return Err(AuthError::Transport("Nostr pubkey must be 64 characters hex".into()));
+    }
+    let mut bytes = [0u8; 32];
+    for i in 0..32 {
+        let byte_str = &trimmed[i * 2..i * 2 + 2];
+        bytes[i] = u8::from_str_radix(byte_str, 16)
+            .map_err(|_| AuthError::Transport("Invalid hex in Nostr pubkey".into()))?;
+    }
+    Ok(bytes)
+}
+

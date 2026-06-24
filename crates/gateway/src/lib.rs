@@ -985,6 +985,7 @@ pub struct GatewayState {
     pub disable_auth: bool,
     pub markup_bps: u64,
     pub floor_msat: u64,
+    pub auth_url: String,
 }
 
 impl GatewayState {
@@ -995,6 +996,7 @@ impl GatewayState {
         disable_auth: bool,
         markup_bps: u64,
         floor_msat: u64,
+        auth_url: String,
     ) -> Self {
         Self {
             store,
@@ -1007,8 +1009,10 @@ impl GatewayState {
             disable_auth,
             markup_bps,
             floor_msat,
+            auth_url,
         }
     }
+
 
     pub async fn record_wallet_event(&self, principal: &str, kind: &str, amount_msat: i64, status: &str) {
         if let Err(e) = self.store.record_wallet_event(principal, kind, amount_msat, status).await {
@@ -1577,6 +1581,36 @@ async fn process_frame(
                         return Ok(());
                     }
                     
+                    let disable_keybind_verify = std::env::var("DISABLE_KEYBIND_VERIFY")
+                        .map(|v| v == "true")
+                        .unwrap_or(false);
+                    if !disable_keybind_verify {
+                        match charon_core::auth::get_principal_nostr_pubkey(&state.auth_url, &principal).await {
+                            Ok(nostr_pubkey) => {
+                                if !charon_core::crypto::verify_keybind(&keybind, &principal, nostr_pubkey) {
+                                    let err_frame = Frame::Error {
+                                        session_id: None,
+                                        code: ErrorCode::KeyUnverified,
+                                        message: "Keybind verification failed".into(),
+                                        http_status: Some(401),
+                                    };
+                                    let _ = tx.send(err_frame);
+                                    return Ok(());
+                                }
+                            }
+                            Err(_) => {
+                                let err_frame = Frame::Error {
+                                    session_id: None,
+                                    code: ErrorCode::KeyUnverified,
+                                    message: "Failed to fetch principal's Nostr pubkey".into(),
+                                    http_status: Some(401),
+                                };
+                                let _ = tx.send(err_frame);
+                                return Ok(());
+                            }
+                        }
+                    }
+
                     let _ = state.register_provider(
                         principal.clone(),
                         models,
@@ -1632,6 +1666,36 @@ async fn process_frame(
                 };
                 let _ = tx.send(err_frame);
                 return Ok(());
+            }
+
+            let disable_keybind_verify = std::env::var("DISABLE_KEYBIND_VERIFY")
+                .map(|v| v == "true")
+                .unwrap_or(false);
+            if !disable_keybind_verify {
+                match charon_core::auth::get_principal_nostr_pubkey(&state.auth_url, &consumer_principal).await {
+                    Ok(nostr_pubkey) => {
+                        if !charon_core::crypto::verify_keybind(&envelope.consumer_keybind, &consumer_principal, nostr_pubkey) {
+                            let err_frame = Frame::Error {
+                                session_id: Some(session_id.clone()),
+                                code: ErrorCode::KeyUnverified,
+                                message: "Consumer keybind verification failed".into(),
+                                http_status: Some(401),
+                            };
+                            let _ = tx.send(err_frame);
+                            return Ok(());
+                        }
+                    }
+                    Err(_) => {
+                        let err_frame = Frame::Error {
+                            session_id: Some(session_id.clone()),
+                            code: ErrorCode::KeyUnverified,
+                            message: "Failed to fetch consumer's Nostr pubkey".into(),
+                            http_status: Some(401),
+                        };
+                        let _ = tx.send(err_frame);
+                        return Ok(());
+                    }
+                }
             }
             
             if !state.check_consumer_open_rate_limit(&consumer_principal) {
@@ -2074,7 +2138,8 @@ mod tests {
         let auth = Arc::new(GnosisAuthenticator::new("http://auth".to_string(), true));
         let verifier = Arc::new(DevPaymentVerifier);
         let store = Arc::new(InMemoryStore::new());
-        let state = Arc::new(GatewayState::new(store, auth, verifier, true, 0, 0));
+        std::env::set_var("DISABLE_KEYBIND_VERIFY", "true");
+        let state = Arc::new(GatewayState::new(store, auth, verifier, true, 0, 0, "http://auth".to_string()));
 
         let models = vec![ModelCard {
             name: "test-model".to_string(),

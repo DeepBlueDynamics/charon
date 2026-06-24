@@ -17,3 +17,5 @@ tracing.workspace = true
 snow.workspace = true
 blake2.workspace = true
 x25519-dalek.workspace = true
+secp256k1 = "0.29.1"
+
