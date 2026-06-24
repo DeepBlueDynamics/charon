@@ -116,6 +116,7 @@ struct ConsumerState {
     pins: Arc<Mutex<SimplePinStore>>,
     models: Arc<Vec<ModelConfig>>,
     cashu_mint: String,
+    wallet: Arc<cdk::wallet::Wallet>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -240,6 +241,41 @@ async fn run_consumer(listen: String, gateway: String, ahp_token: Option<String>
     let static_private = load_consumer_private()?;
     let keybind = keybind_for_private(&static_private);
     let principal = consumer_principal(ahp_token.as_deref()).await?;
+
+    let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/opt/nemesis8".to_string());
+    let charon_dir = std::path::PathBuf::from(&home_dir).join(".charon");
+    std::fs::create_dir_all(&charon_dir)?;
+    let db_path = charon_dir.join("wallet.sqlite");
+    
+    let localstore = cdk_sqlite::WalletSqliteDatabase::new(db_path).await
+        .map_err(|e| anyhow!("Failed to initialize SQLite database: {:?}", e))?;
+        
+    let seed_path = charon_dir.join("seed");
+    let seed = if seed_path.exists() {
+        let bytes = std::fs::read(&seed_path)?;
+        if bytes.len() < 64 {
+            return Err(anyhow!("Seed file is truncated"));
+        }
+        let mut seed = [0u8; 64];
+        seed.copy_from_slice(&bytes[0..64]);
+        seed
+    } else {
+        let mut seed = [0u8; 64];
+        for chunk in seed.chunks_mut(16) {
+            chunk.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        }
+        std::fs::write(&seed_path, &seed)?;
+        seed
+    };
+    
+    let wallet = cdk::wallet::Wallet::new(
+        &cashu_mint,
+        cdk::nuts::CurrencyUnit::Sat,
+        Arc::new(localstore),
+        seed,
+        None,
+    ).map_err(|e| anyhow!("Failed to initialize wallet: {:?}", e))?;
+
     let state = ConsumerState {
         gateway,
         ahp_token,
@@ -249,12 +285,16 @@ async fn run_consumer(listen: String, gateway: String, ahp_token: Option<String>
         pins: Arc::new(Mutex::new(SimplePinStore::new())),
         models: Arc::new(load_consumer_models()?),
         cashu_mint,
+        wallet: Arc::new(wallet),
     };
 
     let app = Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/estimate-cost", post(estimate_cost))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/fund", post(fund_wallet))
+        .route("/v1/fund/{quote_id}", get(check_funding))
+        .route("/v1/balance", get(get_balance))
         .with_state(state);
 
     let addr: SocketAddr = listen.parse()?;
@@ -394,6 +434,47 @@ async fn chat_completions(State(state): State<ConsumerState>, Json(body): Json<V
     let Some(model_name) = body.get("model").and_then(Value::as_str).map(str::to_string) else {
         return api_error(StatusCode::BAD_REQUEST, "invalid_request", "missing model".to_string());
     };
+    let Some(model) = state.models.iter().find(|m| m.name == model_name) else {
+        return api_error(StatusCode::NOT_FOUND, "no_provider", format!("no pinned provider for model {model_name}"));
+    };
+
+    let max_tokens = body
+        .get("max_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| default_max_tokens() as u64)
+        .min(u32::MAX as u64) as u32;
+    let messages = body.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+    let est_input_tokens = estimate_input_tokens(&messages);
+
+    let priced = quote(
+        Rate {
+            price_msat_per_mtok_in: model.price_msat_per_mtok_in,
+            price_msat_per_mtok_out: model.price_msat_per_mtok_out,
+        },
+        est_input_tokens,
+        max_tokens,
+        DEFAULT_MARKUP_BPS,
+        DEFAULT_FLOOR_MSAT,
+    );
+    let total_msat = priced.total_msat;
+    let needed_sat = (total_msat + 999) / 1000;
+
+    let balance = match state.wallet.total_balance().await {
+        Ok(b) => u64::from(b),
+        Err(e) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, "wallet_error", format!("Failed to get balance: {:?}", e)),
+    };
+
+    if balance < needed_sat {
+        return (
+            StatusCode::PAYMENT_REQUIRED,
+            Json(json!({
+                "error": "payment_required",
+                "balance_sat": balance,
+                "needed_sat": needed_sat
+            })),
+        ).into_response();
+    }
+
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
 
     if stream {
@@ -418,14 +499,24 @@ async fn chat_completions(State(state): State<ConsumerState>, Json(body): Json<V
                     }
                 }
                 Err(err) => {
-                    yield Ok::<_, Infallible>(
-                        Event::default().json_data(json!({
-                            "error": {
-                                "code": "relay_failed",
-                                "message": err.to_string()
-                            }
-                        })).expect("SSE error JSON is serializable")
-                    );
+                    if let Some(pay_err) = err.downcast_ref::<PaymentRequiredError>() {
+                        yield Ok::<_, Infallible>(
+                            Event::default().json_data(json!({
+                                "error": "payment_required",
+                                "balance_sat": pay_err.balance_sat,
+                                "needed_sat": pay_err.needed_sat
+                            })).expect("SSE error JSON is serializable")
+                        );
+                    } else {
+                        yield Ok::<_, Infallible>(
+                            Event::default().json_data(json!({
+                                "error": {
+                                    "code": "relay_failed",
+                                    "message": err.to_string()
+                                }
+                            })).expect("SSE error JSON is serializable")
+                        );
+                    }
                     yield Ok::<_, Infallible>(Event::default().data("[DONE]"));
                 }
             }
@@ -433,74 +524,179 @@ async fn chat_completions(State(state): State<ConsumerState>, Json(body): Json<V
         Sse::new(stream)
             .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
             .into_response()
-    } else if state.models.iter().any(|model| model.name == model_name) {
+    } else {
         match consumer_relay(state, body).await {
             Ok(chunks) => {
                 let bytes = chunks.into_iter().flatten().collect::<Vec<u8>>();
                 (StatusCode::OK, [("content-type", "application/json")], bytes).into_response()
             }
-            Err(err) => api_error(StatusCode::BAD_GATEWAY, "relay_failed", err.to_string()),
+            Err(err) => {
+                if let Some(pay_err) = err.downcast_ref::<PaymentRequiredError>() {
+                    (
+                        StatusCode::PAYMENT_REQUIRED,
+                        Json(json!({
+                            "error": "payment_required",
+                            "balance_sat": pay_err.balance_sat,
+                            "needed_sat": pay_err.needed_sat
+                        })),
+                    ).into_response()
+                } else {
+                    api_error(StatusCode::BAD_GATEWAY, "relay_failed", err.to_string())
+                }
+            }
         }
-    } else {
-        api_error(StatusCode::NOT_FOUND, "no_provider", format!("no pinned provider for model {model_name}"))
     }
 }
 
-async fn mint_cashu_token(mint_url_str: &str, amount_msat: u64) -> anyhow::Result<String> {
-    use std::str::FromStr;
-    use cdk::wallet::Wallet;
-    use cdk::Amount;
-    use cdk::nuts::{CurrencyUnit, PaymentMethod, nut00::KnownMethod, nut00::Token};
-    use cdk::mint_url::MintUrl;
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct PaymentRequiredError {
+    pub balance_sat: u64,
+    pub needed_sat: u64,
+}
 
-    // Mint a small buffer above the price (2% + 2 sat) so the gateway's redeem
-    // swap fee at the mint doesn't leave the net below the price -> Underpaid.
-    let base_sats = ((amount_msat + 999) / 1000).max(1);
-    let total_sats = base_sats + base_sats / 50 + 2;
+impl std::fmt::Display for PaymentRequiredError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "payment_required: balance={} needed={}", self.balance_sat, self.needed_sat)
+    }
+}
+
+impl std::error::Error for PaymentRequiredError {}
+
+async fn spend_cashu_token(wallet: &cdk::wallet::Wallet, amount_msat: u64) -> anyhow::Result<String> {
+    use cdk::Amount;
+    use cdk::wallet::SendOptions;
+
+    let needed_sat = (amount_msat + 999) / 1000;
     
-    // Create ephemeral db
-    let localstore = cdk_sqlite::wallet::memory::empty().await
-        .map_err(|e| anyhow!("Failed to create empty in-memory wallet db: {:?}", e))?;
-        
-    // Generate a random seed
-    let mut seed = [0u8; 64];
-    for chunk in seed.chunks_mut(16) {
-        chunk.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    let balance = wallet.total_balance().await.map_err(|e| anyhow!("Failed to get balance: {:?}", e))?;
+    let balance_sat: u64 = balance.into();
+    if balance_sat < needed_sat {
+        return Err(anyhow::anyhow!(PaymentRequiredError { balance_sat, needed_sat }));
     }
     
-    // Initialize wallet
-    let wallet = Wallet::new(
-        mint_url_str,
-        CurrencyUnit::Sat,
-        Arc::new(localstore),
-        seed,
-        None,
-    ).map_err(|e| anyhow!("Failed to initialize wallet: {:?}", e))?;
+    let prepared = wallet.prepare_send(
+        Amount::from(needed_sat),
+        SendOptions::default(),
+    ).await.map_err(|e| {
+        tracing::warn!("Failed to prepare send: {:?}", e);
+        anyhow::anyhow!(PaymentRequiredError { balance_sat, needed_sat })
+    })?;
     
-    // Request mint quote
-    let amount = Amount::from(total_sats);
-    let quote = wallet.mint_quote(
-        PaymentMethod::Known(KnownMethod::Bolt11),
+    let token = prepared.confirm(None).await
+        .map_err(|e| anyhow!("Failed to confirm send: {:?}", e))?;
+    Ok(token.to_string())
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct FundRequest {
+    amount_sat: u64,
+}
+
+async fn fund_wallet(
+    State(state): State<ConsumerState>,
+    Json(request): Json<FundRequest>,
+) -> Response {
+    let amount = cdk::Amount::from(request.amount_sat);
+    match state.wallet.mint_quote(
+        cdk::nuts::PaymentMethod::Known(cdk::nuts::nut00::KnownMethod::Bolt11),
         Some(amount),
         None,
         None,
-    ).await.map_err(|e| anyhow!("Failed to get mint quote: {:?}", e))?;
-    
-    // wait and mint the quote
-    let target = cdk::amount::SplitTarget::default();
-    let proofs = wallet.wait_and_mint_quote(
-        quote,
-        target,
-        None,
-        Duration::from_secs(15),
-    ).await.map_err(|e| anyhow!("Failed to mint quote: {:?}", e))?;
-    
-    // Serialize to Token
-    let mint_url = MintUrl::from_str(mint_url_str)
-        .map_err(|e| anyhow!("Invalid mint URL: {:?}", e))?;
-    let token = Token::new(mint_url, proofs, None, CurrencyUnit::Sat);
-    
-    Ok(token.to_string())
+    ).await {
+        Ok(quote) => {
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "quote_id": quote.id,
+                    "request": quote.request,
+                    "amount_sat": request.amount_sat
+                })),
+            ).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": format!("Failed to create mint quote: {:?}", e)
+                })),
+            ).into_response()
+        }
+    }
+}
+
+async fn check_funding(
+    State(state): State<ConsumerState>,
+    axum::extract::Path(quote_id): axum::extract::Path<String>,
+) -> Response {
+    match state.wallet.check_mint_quote(&quote_id).await {
+        Ok(quote) => {
+            if quote.state == cdk::nuts::MintQuoteState::Paid {
+                if let Err(e) = state.wallet.mint(&quote_id, cdk::amount::SplitTarget::default(), None).await {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": format!("Failed to mint quote: {:?}", e)
+                        })),
+                    ).into_response();
+                }
+            }
+            
+            // Get updated balance
+            let balance = match state.wallet.total_balance().await {
+                Ok(b) => u64::from(b),
+                Err(e) => {
+                    return (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": format!("Failed to fetch balance: {:?}", e)
+                        })),
+                    ).into_response();
+                }
+            };
+            
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "state": format!("{:?}", quote.state),
+                    "balance_sat": balance
+                })),
+            ).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": format!("Failed to check mint quote status: {:?}", e)
+                })),
+            ).into_response()
+        }
+    }
+}
+
+async fn get_balance(
+    State(state): State<ConsumerState>,
+) -> Response {
+    match state.wallet.total_balance().await {
+        Ok(balance) => {
+            let balance_sat = u64::from(balance);
+            let balance_msat = balance_sat * 1000;
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "balance_sat": balance_sat,
+                    "balance_msat": balance_msat
+                })),
+            ).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "error": format!("Failed to fetch balance: {:?}", e)
+                })),
+            ).into_response()
+        }
+    }
 }
 
 async fn consumer_relay(state: ConsumerState, body: Value) -> anyhow::Result<Vec<Vec<u8>>> {
@@ -539,9 +735,9 @@ async fn consumer_relay(state: ConsumerState, body: Value) -> anyhow::Result<Vec
         DEFAULT_FLOOR_MSAT,
     );
     let total_msat = priced.total_msat;
-    tracing::info!(total_msat, mint = %state.cashu_mint, "minting Cashu payment for request");
+    tracing::info!(total_msat, mint = %state.cashu_mint, "spending Cashu payment for request");
 
-    let cashu_token = mint_cashu_token(&state.cashu_mint, total_msat).await?;
+    let cashu_token = spend_cashu_token(&state.wallet, total_msat).await?;
 
     let session_id = uuid::Uuid::new_v4().to_string();
     let envelope = Envelope {
