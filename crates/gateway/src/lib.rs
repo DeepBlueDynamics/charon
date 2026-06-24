@@ -19,6 +19,15 @@ use charon_core::wire::Payout;
 use charon_core::payment::Rate;
 use firestore::{paths, FirestoreDb};
 
+/// Starter balance (msat) for a brand-new principal. **0 in production** — set
+/// CHARON_DEV_BALANCE_MSAT to seed dev/test wallets before a real mint exists.
+fn dev_balance_msat() -> u64 {
+    std::env::var("CHARON_DEV_BALANCE_MSAT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0)
+}
+
 // Authenticator seam (object-safe)
 pub trait Authenticator: Send + Sync {
     fn authenticate<'a>(
@@ -327,7 +336,7 @@ impl Store for InMemoryStore {
         Box::pin(async move {
             let mut wallets = self.wallets.lock().unwrap();
             let wallet = wallets.entry(principal.to_string()).or_insert_with(|| UserWallet {
-                balance_msat: 10_000_000_000,
+                balance_msat: dev_balance_msat(),
                 history: Vec::new(),
             });
             Ok(wallet.balance_msat)
@@ -351,7 +360,7 @@ impl Store for InMemoryStore {
 
             let mut wallets = self.wallets.lock().unwrap();
             let wallet = wallets.entry(principal.to_string()).or_insert_with(|| UserWallet {
-                balance_msat: 10_000_000_000,
+                balance_msat: dev_balance_msat(),
                 history: Vec::new(),
             });
 
@@ -378,7 +387,7 @@ impl Store for InMemoryStore {
 
             let mut wallets = self.wallets.lock().unwrap();
             let wallet = wallets.entry(principal.to_string()).or_insert_with(|| UserWallet {
-                balance_msat: 10_000_000_000,
+                balance_msat: dev_balance_msat(),
                 history: Vec::new(),
             });
 
@@ -577,7 +586,7 @@ impl Store for CloudStore {
                 .obj()
                 .one(principal)
                 .await?;
-            Ok(doc_opt.map(|d| d.balance_msat).unwrap_or(10_000_000_000))
+            Ok(doc_opt.map(|d| d.balance_msat).unwrap_or_else(dev_balance_msat))
         })
     }
 
