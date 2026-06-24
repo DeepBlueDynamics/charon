@@ -28,6 +28,12 @@ uuid.workspace = true
 clap.workspace = true
 axum = { workspace = true, features = ["ws"] }
 tower-http = { workspace = true }
+cdk.workspace = true
+cdk-http-client.workspace = true
+cdk-sqlite.workspace = true
+sha2 = "0.10"
 
 [dev-dependencies]
+
 reqwest = { workspace = true }
+

@@ -413,6 +413,14 @@ impl GatewayState {
         providers.get(principal).cloned()
     }
 
+    pub fn find_provider_by_handle(&self, handle: &str) -> Option<ProviderConnection> {
+        let providers = self.providers.lock().unwrap();
+        providers
+            .values()
+            .find(|p| provider_handle(&p.principal) == handle)
+            .cloned()
+    }
+
     pub fn add_session(&self, session: SessionInfo) {
         let session_id = session.session_id.clone();
         let consumer = session.consumer_principal.clone();
@@ -497,6 +505,13 @@ impl FromRequestParts<Arc<GatewayState>> for HttpPrincipal {
     }
 }
 
+pub fn provider_handle(principal: &str) -> String {
+    use sha2::Digest;
+    let hash = sha2::Sha256::digest(principal.as_bytes());
+    let hex_str: String = hash.iter().map(|b| format!("{:02x}", b)).collect();
+    format!("charon:{}", &hex_str[..12])
+}
+
 #[derive(serde::Serialize)]
 pub struct DirectoryEntry {
     pub principal: String,
@@ -511,7 +526,7 @@ pub async fn get_directory(
     let entries: Vec<DirectoryEntry> = providers
         .values()
         .map(|p| DirectoryEntry {
-            principal: p.principal.clone(),
+            principal: provider_handle(&p.principal),
             models: p.models.clone(),
         })
         .collect();
@@ -920,6 +935,11 @@ async fn process_frame(
             }
             
             let provider = match state.get_provider(&envelope.provider) {
+                Some(p) => Some(p),
+                None => state.find_provider_by_handle(&envelope.provider),
+            };
+            
+            let provider = match provider {
                 Some(p) => p,
                 None => {
                     let err_frame = Frame::Error {
@@ -1293,6 +1313,60 @@ mod tests {
         let payment = Payment::Cashu { token: MOCK_TOKEN.to_string() };
         let res = verifier.verify_payment(&payment, 1000).await;
         assert_eq!(res, Err(ErrorCode::PaymentRequired));
+    }
+
+    #[tokio::test]
+    async fn test_provider_pseudonymous_handle() {
+        let email = "provider@example.com";
+        let handle = provider_handle(email);
+
+        // 1. Assert handle format (contains charon: and no @)
+        assert!(handle.starts_with("charon:"));
+        assert!(!handle.contains('@'));
+
+        // 2. Setup gateway state
+        let auth = Arc::new(GnosisAuthenticator::new("http://auth".to_string(), true));
+        let verifier = Arc::new(DevPaymentVerifier);
+        let state = Arc::new(GatewayState::new(auth, verifier, true, 0, 0));
+
+        let models = vec![ModelCard {
+            name: "test-model".to_string(),
+            backend: "ollama".to_string(),
+            context_length: 2048,
+            price_msat_per_mtok_in: 10,
+            price_msat_per_mtok_out: 10,
+        }];
+        let keybind = Keybind {
+            x25519_pub: "key".to_string(),
+            sig: "sig".to_string(),
+            not_after: 0,
+        };
+        let payout = charon_core::wire::Payout {
+            rail: "cashu".to_string(),
+            address: "target".to_string(),
+        };
+        let connection_id = Uuid::new_v4();
+
+        state.register_provider(email.to_string(), models, keybind, payout, connection_id);
+
+        // 3. Verify handle resolution
+        let resolved = state.find_provider_by_handle(&handle);
+        assert!(resolved.is_some());
+        assert_eq!(resolved.unwrap().principal, email);
+
+        // 4. Verify raw principal still works
+        let resolved_raw = state.get_provider(email);
+        assert!(resolved_raw.is_some());
+        assert_eq!(resolved_raw.unwrap().principal, email);
+
+        // 5. Test get_directory endpoint obfuscation
+        let state_extractor = axum::extract::State(state.clone());
+        let http_principal = HttpPrincipal(email.to_string());
+        let res_json = get_directory(state_extractor, http_principal).await;
+        let entries = res_json.0;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].principal, handle);
+        assert!(!entries[0].principal.contains('@'));
     }
 }
 

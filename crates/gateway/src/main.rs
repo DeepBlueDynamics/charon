@@ -2,8 +2,10 @@
 
 use clap::Parser;
 use std::sync::Arc;
+use std::collections::HashSet;
+use std::str::FromStr;
 use tokio::net::TcpListener;
-use charon_gateway::{GatewayState, GnosisAuthenticator, DevPaymentVerifier, run_server};
+use charon_gateway::{GatewayState, GnosisAuthenticator, DevPaymentVerifier, CashuVerifier, run_server};
 
 #[derive(Parser, Debug)]
 #[command(name = "charon-gateway", version, about = "Charon blind relay")]
@@ -23,6 +25,9 @@ struct Args {
     /// Gateway floor in msat.
     #[arg(long, env = "FLOOR_MSAT", default_value_t = charon_core::payment::DEFAULT_FLOOR_MSAT)]
     floor_msat: u64,
+    /// Comma-separated Cashu mint allowlist.
+    #[arg(long, env = "CASHU_MINT_ALLOWLIST", default_value = "https://testnut.cashu.space")]
+    cashu_mint_allowlist: String,
 }
 
 #[tokio::main]
@@ -39,10 +44,25 @@ async fn main() -> anyhow::Result<()> {
         args.bind = format!("0.0.0.0:{port}");
     }
 
-    tracing::info!(bind = %args.bind, auth = %args.auth_url, disable_auth = %args.disable_auth, "charon-gateway starting");
+    tracing::info!(bind = %args.bind, auth = %args.auth_url, disable_auth = %args.disable_auth, allowlist = %args.cashu_mint_allowlist, "charon-gateway starting");
 
     let authenticator = Arc::new(GnosisAuthenticator::new(args.auth_url.clone(), args.disable_auth));
-    let payment_verifier = Arc::new(DevPaymentVerifier);
+    
+    let payment_verifier: Arc<dyn charon_gateway::PaymentVerifier> = if args.disable_auth {
+        Arc::new(DevPaymentVerifier)
+    } else {
+        let mut allowlist = HashSet::new();
+        for item in args.cashu_mint_allowlist.split(',') {
+            let trimmed = item.trim();
+            if !trimmed.is_empty() {
+                let normalized = cdk::mint_url::MintUrl::from_str(trimmed)
+                    .map(|m| m.to_string())
+                    .unwrap_or_else(|_| trimmed.to_string());
+                allowlist.insert(normalized);
+            }
+        }
+        Arc::new(CashuVerifier::new(allowlist))
+    };
 
     let state = Arc::new(GatewayState::new(
         authenticator,
@@ -59,3 +79,4 @@ async fn main() -> anyhow::Result<()> {
 
     Ok(())
 }
+
