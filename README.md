@@ -66,6 +66,7 @@ Practical guides live in [`docs/`](./docs) (start at [`docs/README.md`](./docs/R
 - [Quickstart](./docs/quickstart.md) — run the whole marketplace locally in dev.
 - [Provider guide](./docs/provider-guide.md) · [Consumer guide](./docs/consumer-guide.md)
 - [Gateway deploy](./docs/gateway-deploy.md) — dev + Cloud Run.
+- [Mint operations](./docs/mint-operations.md) — the operator's one Lightning mint (cdk-mintd + LND). Providers and users need no node.
 - [API reference](./docs/api-reference.md) — gateway control-plane + consumer OpenAI endpoints.
 - [Setup checklist](./docs/setup-checklist.md) — operator action items (accounts, DNS, decisions).
 
