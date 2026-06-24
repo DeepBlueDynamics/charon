@@ -35,6 +35,9 @@ struct Cli {
     /// NUTS ahp_ token for this principal.
     #[arg(long, env = "NUTS_AHP_TOKEN")]
     ahp_token: Option<String>,
+    /// Cashu mint URL.
+    #[arg(long, env = "CASHU_MINT_URL", default_value = "https://testnut.cashu.space")]
+    cashu_mint: String,
     #[command(subcommand)]
     role: Role,
 }
@@ -65,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
     let cli = Cli::parse();
     match cli.role {
-        Role::Consumer { listen } => run_consumer(listen, cli.gateway, cli.ahp_token).await,
+        Role::Consumer { listen } => run_consumer(listen, cli.gateway, cli.ahp_token, cli.cashu_mint).await,
         Role::Provider { config, ollama } => run_provider(config, ollama, cli.gateway, cli.ahp_token).await,
     }
 }
@@ -79,6 +82,7 @@ struct ConsumerState {
     keybind: Keybind,
     pins: Arc<Mutex<SimplePinStore>>,
     models: Arc<Vec<ModelConfig>>,
+    cashu_mint: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -199,7 +203,7 @@ struct ProviderSession {
     session: Option<charon_core::crypto::Session>,
 }
 
-async fn run_consumer(listen: String, gateway: String, ahp_token: Option<String>) -> anyhow::Result<()> {
+async fn run_consumer(listen: String, gateway: String, ahp_token: Option<String>, cashu_mint: String) -> anyhow::Result<()> {
     let static_private = load_consumer_private()?;
     let keybind = keybind_for_private(&static_private);
     let principal = consumer_principal(ahp_token.as_deref()).await?;
@@ -211,6 +215,7 @@ async fn run_consumer(listen: String, gateway: String, ahp_token: Option<String>
         keybind,
         pins: Arc::new(Mutex::new(SimplePinStore::new())),
         models: Arc::new(load_consumer_models()?),
+        cashu_mint,
     };
 
     let app = Router::new()
@@ -408,6 +413,60 @@ async fn chat_completions(State(state): State<ConsumerState>, Json(body): Json<V
     }
 }
 
+async fn mint_cashu_token(mint_url_str: &str, amount_msat: u64) -> anyhow::Result<String> {
+    use std::str::FromStr;
+    use cdk::wallet::Wallet;
+    use cdk::Amount;
+    use cdk::nuts::{CurrencyUnit, PaymentMethod, nut00::KnownMethod, nut00::Token};
+    use cdk::mint_url::MintUrl;
+
+    let total_sats = ((amount_msat + 999) / 1000).max(1);
+    
+    // Create ephemeral db
+    let localstore = cdk_sqlite::wallet::memory::empty().await
+        .map_err(|e| anyhow!("Failed to create empty in-memory wallet db: {:?}", e))?;
+        
+    // Generate a random seed
+    let mut seed = [0u8; 64];
+    for chunk in seed.chunks_mut(16) {
+        chunk.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+    }
+    
+    // Initialize wallet
+    let wallet = Wallet::new(
+        mint_url_str,
+        CurrencyUnit::Sat,
+        Arc::new(localstore),
+        seed,
+        None,
+    ).map_err(|e| anyhow!("Failed to initialize wallet: {:?}", e))?;
+    
+    // Request mint quote
+    let amount = Amount::from(total_sats);
+    let quote = wallet.mint_quote(
+        PaymentMethod::Known(KnownMethod::Bolt11),
+        Some(amount),
+        None,
+        None,
+    ).await.map_err(|e| anyhow!("Failed to get mint quote: {:?}", e))?;
+    
+    // wait and mint the quote
+    let target = cdk::amount::SplitTarget::default();
+    let proofs = wallet.wait_and_mint_quote(
+        quote,
+        target,
+        None,
+        Duration::from_secs(15),
+    ).await.map_err(|e| anyhow!("Failed to mint quote: {:?}", e))?;
+    
+    // Serialize to Token
+    let mint_url = MintUrl::from_str(mint_url_str)
+        .map_err(|e| anyhow!("Invalid mint URL: {:?}", e))?;
+    let token = Token::new(mint_url, proofs, None, CurrencyUnit::Sat);
+    
+    Ok(token.to_string())
+}
+
 async fn consumer_relay(state: ConsumerState, body: Value) -> anyhow::Result<Vec<Vec<u8>>> {
     let model_name = body
         .get("model")
@@ -433,6 +492,21 @@ async fn consumer_relay(state: ConsumerState, body: Value) -> anyhow::Result<Vec
         pins.verify_or_pin(&model.provider, model.provider_x25519_pub)?;
     }
 
+    let priced = quote(
+        Rate {
+            price_msat_per_mtok_in: model.price_msat_per_mtok_in,
+            price_msat_per_mtok_out: model.price_msat_per_mtok_out,
+        },
+        est_input_tokens,
+        max_tokens,
+        DEFAULT_MARKUP_BPS,
+        DEFAULT_FLOOR_MSAT,
+    );
+    let total_msat = priced.total_msat;
+    tracing::info!(total_msat, mint = %state.cashu_mint, "minting Cashu payment for request");
+
+    let cashu_token = mint_cashu_token(&state.cashu_mint, total_msat).await?;
+
     let session_id = uuid::Uuid::new_v4().to_string();
     let envelope = Envelope {
         provider: model.provider.clone(),
@@ -440,7 +514,7 @@ async fn consumer_relay(state: ConsumerState, body: Value) -> anyhow::Result<Vec
         model: model.name.clone(),
         max_tokens,
         est_input_tokens,
-        payment: Payment::Cashu { token: "cashuB-dev".to_string() },
+        payment: Payment::Cashu { token: cashu_token },
         consumer_keybind: state.keybind.clone(),
     };
 
