@@ -2,7 +2,7 @@
 
 A blind, end-to-end-encrypted marketplace for LLM inference, paid in bitcoin,
 built on the NUTS ecosystem. Providers run Ollama and choose which models to
-sell; consumers run any coding agent (via Nemesis8) against those models. A
+sell; consumers run any coding agent (via [Nemesis8](https://github.com/DeepBlueDynamics/nemesis8)) against those models. A
 central gateway authenticates both sides with NUTS tokens, matches them, relays
 opaque ciphertext, settles payment, and takes a fee — without ever seeing a
 prompt or a reply.
@@ -103,6 +103,11 @@ The authoritative description lives in [`spec/`](./spec). Start with
 - [10 — Security & Threat Model](./spec/10-security-threat-model.md)
 - [11 — Deployment](./spec/11-deployment.md)
 - [12 — UI / Dashboard](./spec/12-ui-dashboard.md)
+
+## Related
+
+- [Nemesis8](https://github.com/DeepBlueDynamics/nemesis8) — sealed-container agent harness; runs any coding agent against a Charon model (spec [07](./spec/07-consumer-nemesis8.md)).
+- [auth.nuts.services](https://auth.nuts.services) — NUTS identity & tokens (spec [02](./spec/02-identity-auth.md)).
 
 ## License
 
