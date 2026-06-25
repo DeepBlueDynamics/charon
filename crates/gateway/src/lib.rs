@@ -1251,6 +1251,9 @@ pub fn provider_handle(principal: &str) -> String {
 #[derive(serde::Serialize)]
 pub struct DirectoryEntry {
     pub principal: String,
+    /// The provider's static X25519 public key (base64), from its keybind, so a
+    /// consumer can pin it (CHARON_PROVIDER_X25519_PUB) without a prior handshake.
+    pub x25519_pub: String,
     pub models: Vec<ModelCard>,
 }
 
@@ -1263,6 +1266,7 @@ pub async fn get_directory(
         .into_iter()
         .map(|p| DirectoryEntry {
             principal: provider_handle(&p.principal),
+            x25519_pub: p.keybind.x25519_pub,
             models: p.models,
         })
         .collect();
