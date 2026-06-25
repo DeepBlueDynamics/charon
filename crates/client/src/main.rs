@@ -469,7 +469,7 @@ $('fundBtn').onclick=async()=>{
     clearInterval(pollTimer);
     pollTimer=setInterval(async()=>{
       try{const c=await j('/v1/fund/'+f.quote_id);
-        if(c.state==='Paid'||c.balance_sat!=null){clearInterval(pollTimer);$('qrwrap').classList.add('hide');$('fundMsg').textContent='funded ✓';$('fundBtn').disabled=false;refreshBal();}
+        if(c.state==='Paid'||c.state==='Issued'){clearInterval(pollTimer);$('qrwrap').classList.add('hide');$('fundMsg').textContent='funded ✓';$('fundBtn').disabled=false;refreshBal();}
       }catch(e){}
     },3000);
   }catch(e){$('fundMsg').textContent='error: '+e.message;$('fundBtn').disabled=false;}

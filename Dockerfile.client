@@ -1,0 +1,24 @@
+# Charon client — one image, all roles (consumer / provider / mcp / keygen).
+# Two-stage build, slim runtime (spec 11).
+FROM rust:1-slim-bookworm AS build
+# cdk pulls reqwest's native-tls, which links OpenSSL on Linux.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends pkg-config libssl-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY . .
+RUN cargo build --release -p charon
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+ && rm -rf /var/lib/apt/lists/*
+COPY --from=build /app/target/release/charon /usr/local/bin/charon
+# Defaults to the consumer proxy on :8088. Override the command for other roles:
+#   docker run ... charon provider --config /cfg/charon-provider.toml
+#   docker run ... charon mcp
+#   docker run ... charon keygen --out /keys
+ENV CHARON_LISTEN=0.0.0.0:8088
+EXPOSE 8088
+ENTRYPOINT ["charon"]
+CMD ["consumer"]
