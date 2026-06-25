@@ -613,8 +613,8 @@ impl Store for CloudStore {
             };
 
             self.db.fluent()
-                .insert()
-                .into("wallets")
+                .update()
+                .in_col("wallets")
                 .document_id(principal)
                 .object(&WalletDoc { balance_msat: new_balance })
                 .execute::<()>()
@@ -727,8 +727,8 @@ impl Store for CloudStore {
             };
 
             self.db.fluent()
-                .insert()
-                .into("providers")
+                .update()
+                .in_col("providers")
                 .document_id(&doc.principal)
                 .object(&doc)
                 .execute::<()>()
