@@ -42,6 +42,45 @@ crates/
 spec/        00–12          authoritative protocol + deployment + UI specs
 ```
 
+## Run with Docker
+
+One command installs the client (consumer / provider / mcp) from Docker Hub:
+
+```bash
+# Linux / macOS
+curl -fsSL https://charon.nuts.services/install.sh | sh
+# Windows (PowerShell)
+irm https://charon.nuts.services/install.ps1 | iex
+```
+
+It pulls `deepbluedynamics/charon`, mounts a persistent `~/.charon` (your X25519
++ Nostr keybind), runs `keygen`, and asks whether you're a **consumer** or a
+**provider**. Non-interactive: `… | sh -s -- provider`.
+
+Or run the images directly (the `~/.charon` volume must persist — it holds your
+identity):
+
+```bash
+# Consumer — OpenAI-compatible API on :8088
+docker run --rm -it -v "$HOME/.charon:/root/.charon" -e HOME=/root \
+  -e NUTS_AHP_TOKEN -e CHARON_GATEWAY=wss://charon.nuts.services/ws \
+  -e CASHU_MINT_URL=https://mint.nuts.services -p 8088:8088 \
+  deepbluedynamics/charon consumer
+
+# Provider — next to your Ollama
+docker run --rm -it -v "$HOME/.charon:/root/.charon" -e HOME=/root \
+  -e NUTS_AHP_TOKEN --add-host=host.docker.internal:host-gateway \
+  deepbluedynamics/charon provider --config /root/.charon/charon-provider.toml
+```
+
+Self-host the gateway with `deepbluedynamics/charon-gateway`. After `keygen`,
+register your Nostr key so the keybind verifies:
+
+```bash
+curl -X POST https://auth.nuts.services/api/identity/nostr \
+  -d '{"token":"ahp_...","nostr_pubkey":"<hex from keygen>"}'
+```
+
 ## Quickstart (dev)
 
 Requires Rust and (for the provider) a local Ollama.
