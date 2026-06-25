@@ -63,7 +63,7 @@ identity):
 ```bash
 # Consumer — OpenAI-compatible API on :8088
 docker run --rm -it -v "$HOME/.charon:/root/.charon" -e HOME=/root \
-  -e NUTS_AHP_TOKEN -e CHARON_GATEWAY=wss://charon-gateway-ugcdy6vw7a-uc.a.run.app/ws \
+  -e NUTS_AHP_TOKEN -e CHARON_GATEWAY=wss://gateway.nuts.services/ws \
   -e CASHU_MINT_URL=https://mint.nuts.services -p 8088:8088 \
   deepbluedynamics/charon consumer
 
