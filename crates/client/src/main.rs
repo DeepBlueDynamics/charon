@@ -521,7 +521,8 @@ async fn provider_status(State(c): State<ProviderConsole>) -> Json<Value> {
         .and_then(|p| std::fs::read_to_string(p).ok())
         .and_then(|t| toml::from_str::<ProviderConfig>(&t).ok())
         .map(|cfg| cfg.models.into_iter().map(|m| {
-            json!({"name": m.name, "price_in": m.price_msat_per_mtok_in, "price_out": m.price_msat_per_mtok_out})
+            let om = m.ollama_model.clone().unwrap_or_else(|| m.name.clone());
+            json!({"name": m.name, "ollama_model": om, "price_in": m.price_msat_per_mtok_in, "price_out": m.price_msat_per_mtok_out})
         }).collect::<Vec<_>>())
         .unwrap_or_default();
     Json(json!({
@@ -557,7 +558,7 @@ async fn provider_register_nostr(State(c): State<ProviderConsole>) -> Json<Value
 }
 
 #[derive(serde::Deserialize)]
-struct SaveModel { name: String, price_in: u64, price_out: u64 }
+struct SaveModel { ollama_model: String, name: String, price_in: u64, price_out: u64 }
 
 async fn provider_save_models(State(c): State<ProviderConsole>, Json(models): Json<Vec<SaveModel>>) -> Json<Value> {
     let Some(path) = c.config_path.clone() else { return Json(json!({"ok": false, "error": "no config path"})); };
@@ -573,7 +574,8 @@ async fn provider_save_models(State(c): State<ProviderConsole>, Json(models): Js
     out.push_str(&format!("[identity]\nx25519_key_file = \"{}\"\nkeybind_file = \"{}\"\n\n", cfg.identity.x25519_key_file, cfg.identity.keybind_file));
     out.push_str(&format!("[ollama]\nbase_url = \"{}\"\n\n", ollama));
     for m in &models {
-        out.push_str(&format!("[[models]]\nname = \"{}\"\nollama_model = \"{}\"\ncontext_length = 8192\nprice_msat_per_mtok_in = {}\nprice_msat_per_mtok_out = {}\n\n", m.name, m.name, m.price_in, m.price_out));
+        let display = if m.name.trim().is_empty() { m.ollama_model.clone() } else { m.name.clone() };
+        out.push_str(&format!("[[models]]\nname = \"{}\"\nollama_model = \"{}\"\ncontext_length = 8192\nprice_msat_per_mtok_in = {}\nprice_msat_per_mtok_out = {}\n\n", display, m.ollama_model, m.price_in, m.price_out));
     }
     match std::fs::write(&path, out) {
         Ok(_) => Json(json!({"ok": true, "count": models.len()})),
@@ -622,7 +624,7 @@ input{background:#0f0f11;color:var(--text);border:1px solid var(--border2);borde
 
 <div class="card">
   <h2>2 &middot; Choose models to sell</h2>
-  <p class="muted">Your local Ollama models. Check the ones to expose and set price per million tokens (msat).</p>
+  <p class="muted">Your local Ollama models. Check the ones to sell, set the advertised name (drop :cloud / :latest if you like), and price per million tokens (msat).</p>
   <div id="models" style="margin-top:12px"></div>
   <div class="row" style="margin-top:12px"><button class="btn" id="saveBtn">Save</button><span class="muted" id="saveMsg"></span></div>
   <p class="muted" style="margin-top:8px">After saving, restart the provider to apply.</p>
@@ -636,7 +638,7 @@ async function load(){
   try{
     const s=await j('/api/status');
     $('gw').textContent=s.gateway||'?';$('pid').textContent=s.principal||'?';$('npub').textContent=s.npub||'(no key — run keygen)';
-    (s.models||[]).forEach(m=>{current[m.name]={in:m.price_in,out:m.price_out};});
+    (s.models||[]).forEach(m=>{current[m.ollama_model||m.name]={disp:m.name,in:m.price_in,out:m.price_out};});
   }catch(e){}
   const tags=await j('/api/ollama-tags');
   const box=$('models');box.innerHTML='';
@@ -644,10 +646,12 @@ async function load(){
   if(!names.length){box.innerHTML='<div class="muted">No Ollama models found. Run <b>ollama serve</b> and <b>ollama pull &lt;model&gt;</b>, then reload.</div>';return;}
   names.forEach(n=>{
     const cur=current[n];
+    const disp=cur?cur.disp:n.replace(/:(cloud|latest)$/,'');
     const row=document.createElement('div');row.className='row';row.style='margin-bottom:9px';
-    row.innerHTML='<label style="display:flex;align-items:center;gap:8px;color:var(--text);font-size:13px;min-width:210px"><input type="checkbox" class="msel" data-n="'+n+'" '+(cur?'checked':'')+'> '+n+'</label>'
-      +'<input type="number" class="pin" data-n="'+n+'" value="'+(cur?cur.in:200000)+'" title="msat / Mtok in" style="max-width:120px">'
-      +'<input type="number" class="pout" data-n="'+n+'" value="'+(cur?cur.out:600000)+'" title="msat / Mtok out" style="max-width:120px">';
+    row.innerHTML='<label style="display:flex;align-items:center;gap:8px;color:var(--text);font-size:12.5px;min-width:170px"><input type="checkbox" class="msel" data-n="'+n+'" '+(cur?'checked':'')+'> '+n+'</label>'
+      +'<input type="text" class="dname" data-n="'+n+'" value="'+disp+'" title="advertised name" style="max-width:150px">'
+      +'<input type="number" class="pin" data-n="'+n+'" value="'+(cur?cur.in:200000)+'" title="msat / Mtok in" style="max-width:110px">'
+      +'<input type="number" class="pout" data-n="'+n+'" value="'+(cur?cur.out:600000)+'" title="msat / Mtok out" style="max-width:110px">';
     box.appendChild(row);
   });
 }
@@ -659,7 +663,7 @@ $('regBtn').onclick=async()=>{
 };
 $('saveBtn').onclick=async()=>{
   const models=[];
-  document.querySelectorAll('.msel').forEach(c=>{if(c.checked){const n=c.dataset.n;const pin=document.querySelector('.pin[data-n="'+n+'"]').value;const pout=document.querySelector('.pout[data-n="'+n+'"]').value;models.push({name:n,price_in:parseInt(pin)||200000,price_out:parseInt(pout)||600000});}});
+  document.querySelectorAll('.msel').forEach(c=>{if(c.checked){const n=c.dataset.n;const dn=(document.querySelector('.dname[data-n="'+n+'"]').value||'').trim()||n;const pin=document.querySelector('.pin[data-n="'+n+'"]').value;const pout=document.querySelector('.pout[data-n="'+n+'"]').value;models.push({ollama_model:n,name:dn,price_in:parseInt(pin)||200000,price_out:parseInt(pout)||600000});}});
   if(!models.length){$('saveMsg').textContent='select at least one model';return;}
   $('saveBtn').disabled=true;$('saveMsg').textContent='saving…';
   try{const r=await j('/api/save-models',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(models)});
