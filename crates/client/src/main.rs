@@ -381,6 +381,7 @@ async fn run_consumer(listen: String, gateway: String, ahp_token: Option<String>
     };
 
     let app = Router::new()
+        .route("/", get(consumer_home))
         .route("/v1/models", get(list_models))
         .route("/v1/estimate-cost", post(estimate_cost))
         .route("/v1/chat/completions", post(chat_completions))
@@ -395,6 +396,98 @@ async fn run_consumer(listen: String, gateway: String, ahp_token: Option<String>
     axum::serve(listener, app).await?;
     Ok(())
 }
+
+async fn consumer_home() -> axum::response::Html<&'static str> {
+    axum::response::Html(CONSUMER_HOME)
+}
+
+const CONSUMER_HOME: &str = r##"<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Charon Consumer</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+:root{--bg:#0a0a0b;--surface:#131316;--border:#1f1f24;--border2:#2a2a31;--text:#eceaef;--t2:#b5b3bb;--t3:#7c7a83;--orange:#f7931a;--green:#5fb27a}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,sans-serif;line-height:1.5}
+.wrap{max-width:680px;margin:0 auto;padding:34px 20px}
+h1{font-size:1.25rem;font-weight:700;letter-spacing:.05em;display:flex;align-items:center;gap:10px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px;margin-top:18px}
+.card h2{font-size:.68rem;letter-spacing:.18em;text-transform:uppercase;color:var(--t3);margin-bottom:12px;font-family:ui-monospace,monospace}
+.bal{font-size:2.1rem;font-weight:700;color:var(--orange);font-family:ui-monospace,monospace}
+.bal small{font-size:.85rem;color:var(--t3);font-weight:400}
+input,textarea,select{width:100%;background:#0f0f11;color:var(--text);border:1px solid var(--border2);border-radius:7px;padding:10px 12px;font-family:ui-monospace,monospace;font-size:13px}
+.btn{background:var(--orange);color:#1a1206;border:0;border-radius:7px;padding:10px 18px;font-weight:600;cursor:pointer;font-family:ui-monospace,monospace;font-size:13px;white-space:nowrap}
+.btn:hover{background:#ffa733}.btn:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.qr{background:#fff;padding:14px;border-radius:10px;width:fit-content;margin:14px auto 6px}
+.muted{color:var(--t3);font-size:12px;font-family:ui-monospace,monospace}
+.out{white-space:pre-wrap;background:#0f0f11;border:1px solid var(--border);border-radius:7px;padding:12px;margin-top:10px;font-family:ui-monospace,monospace;font-size:12.5px;color:var(--t2);min-height:18px}
+.hide{display:none}
+</style></head>
+<body><div class="wrap">
+<h1><span class="dot"></span> CHARON &middot; consumer</h1>
+<p class="muted" style="margin-top:6px">Local OpenAI-compatible API on this port. Pay-per-request with bitcoin ecash &mdash; nothing leaves this machine but the encrypted relay.</p>
+
+<div class="card">
+  <h2>Wallet balance</h2>
+  <div class="bal"><span id="bal">&hellip;</span> <small>sat</small></div>
+  <div class="row" style="margin-top:14px">
+    <input id="amt" type="number" value="200" min="1" style="max-width:130px">
+    <button class="btn" id="fundBtn">Add funds</button>
+    <span class="muted" id="fundMsg"></span>
+  </div>
+  <div id="qrwrap" class="hide" style="text-align:center">
+    <div class="qr" id="qr"></div>
+    <div class="muted">Scan with your phone&#39;s Lightning wallet (or Coinbase &rarr; Send &rarr; Lightning)</div>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Test a model</h2>
+  <select id="model"></select>
+  <textarea id="prompt" rows="2" style="margin-top:10px">Say hello in exactly three words</textarea>
+  <div class="row" style="margin-top:10px"><button class="btn" id="sendBtn">Send</button><span class="muted" id="sendMsg"></span></div>
+  <div class="out" id="out"></div>
+</div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+async function j(u,o){const r=await fetch(u,o);return r.json();}
+async function refreshBal(){try{const b=await j('/v1/balance');$('bal').textContent=(b.balance_sat!=null?b.balance_sat:'?');}catch(e){$('bal').textContent='?';}}
+async function loadModels(){try{const m=await j('/v1/models');const s=$('model');s.innerHTML='';const d=m.data||[];d.forEach(x=>{const o=document.createElement('option');o.value=x.id;o.textContent=x.id;s.appendChild(o);});if(!d.length){s.innerHTML='<option value="">(no models &mdash; pin a provider)</option>';}}catch(e){}}
+let pollTimer=null;
+$('fundBtn').onclick=async()=>{
+  const amt=parseInt($('amt').value||'0');if(!amt)return;
+  $('fundBtn').disabled=true;$('fundMsg').textContent='generating invoice…';
+  try{
+    const f=await j('/v1/fund',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({amount_sat:amt})});
+    if(!f.request)throw new Error(f.error||'no invoice');
+    $('qr').innerHTML='';new QRCode($('qr'),{text:f.request.toUpperCase(),width:240,height:240,correctLevel:QRCode.CorrectLevel.M});
+    $('qrwrap').classList.remove('hide');$('fundMsg').textContent='waiting for payment…';
+    clearInterval(pollTimer);
+    pollTimer=setInterval(async()=>{
+      try{const c=await j('/v1/fund/'+f.quote_id);
+        if(c.state==='Paid'||c.balance_sat!=null){clearInterval(pollTimer);$('qrwrap').classList.add('hide');$('fundMsg').textContent='funded ✓';$('fundBtn').disabled=false;refreshBal();}
+      }catch(e){}
+    },3000);
+  }catch(e){$('fundMsg').textContent='error: '+e.message;$('fundBtn').disabled=false;}
+};
+$('sendBtn').onclick=async()=>{
+  if(!$('model').value){$('sendMsg').textContent='no model';return;}
+  $('sendBtn').disabled=true;$('sendMsg').textContent='buying…';$('out').textContent='';
+  try{
+    const r=await fetch('/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:$('model').value,messages:[{role:'user',content:$('prompt').value}]})});
+    const d=await r.json();
+    if(d.error){$('out').textContent='error: '+(typeof d.error==='string'?d.error:JSON.stringify(d.error));}
+    else{$('out').textContent=(d.choices&&d.choices[0]&&d.choices[0].message&&d.choices[0].message.content)||JSON.stringify(d,null,2);}
+    $('sendMsg').textContent='';refreshBal();
+  }catch(e){$('sendMsg').textContent='error: '+e.message;}
+  $('sendBtn').disabled=false;
+};
+refreshBal();loadModels();setInterval(refreshBal,8000);
+</script></body></html>"##;
 
 async fn run_provider(
     config_path: Option<String>,
