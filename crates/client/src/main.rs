@@ -30,7 +30,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 #[command(name = "charon", version, about = "Charon marketplace client")]
 struct Cli {
     /// Gateway WebSocket URL.
-    #[arg(long, env = "CHARON_GATEWAY", default_value = "wss://charon.nuts.services/ws")]
+    #[arg(long, env = "CHARON_GATEWAY", default_value = "wss://gateway.charon.nuts.services/ws")]
     gateway: String,
     /// NUTS ahp_ token for this principal.
     #[arg(long, env = "NUTS_AHP_TOKEN")]
@@ -414,6 +414,30 @@ async fn run_provider(
 
     verify_ollama_models(&runtime.ollama_base_url, &runtime.models).await;
 
+    // Auto-reconnect with backoff. Any gateway eventually drops a long-lived WS
+    // (Cloud Run's 60-min request cap, restarts, transient network). Reconnecting
+    // and re-registering keeps the provider live instead of leaving a zombie
+    // socket + a stale directory entry (which makes consumers hit ProviderGone).
+    let mut backoff_secs = 1u64;
+    loop {
+        let started = std::time::Instant::now();
+        if let Err(e) = provider_session(&runtime).await {
+            tracing::error!(error = ?e, "provider session ended; reconnecting");
+        } else {
+            tracing::warn!("gateway connection closed; reconnecting");
+        }
+        // A connection that lasted a while is healthy: reset backoff so a normal
+        // hourly reconnect is immediate, while a gateway that's truly down backs off.
+        if started.elapsed() > std::time::Duration::from_secs(30) {
+            backoff_secs = 1;
+        }
+        tracing::info!(backoff_secs, "reconnecting to gateway");
+        tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)).await;
+        backoff_secs = backoff_secs.saturating_mul(2).min(30);
+    }
+}
+
+async fn provider_session(runtime: &ProviderRuntime) -> anyhow::Result<()> {
     let (mut ws, _) = connect_async(gateway_url_with_token(&runtime.gateway, Some(&runtime.ahp_token))).await?;
     send_frame(
         &mut ws,
@@ -501,7 +525,7 @@ async fn run_provider(
                     send_frame(&mut ws, &Frame::Hs { session_id, blob: encode_blob(&response) }).await?;
                 }
                 Frame::Req { blob, .. } => {
-                    handle_provider_req(&runtime, &mut ws, &mut sessions, session_id, blob).await?;
+                    handle_provider_req(runtime, &mut ws, &mut sessions, session_id, blob).await?;
                 }
                 Frame::Cancel { .. } => {
                     sessions.remove(&session_id);
