@@ -489,12 +489,194 @@ $('sendBtn').onclick=async()=>{
 refreshBal();loadModels();setInterval(refreshBal,8000);
 </script></body></html>"##;
 
+fn provider_npub_hex() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let path = std::path::PathBuf::from(home).join(".charon").join("nostr.key");
+    let hex_str = std::fs::read_to_string(&path).ok()?;
+    let bytes = hex::decode(hex_str.trim()).ok()?;
+    let sk = secp256k1::SecretKey::from_slice(&bytes).ok()?;
+    let secp = secp256k1::Secp256k1::new();
+    let kp = secp256k1::Keypair::from_secret_key(&secp, &sk);
+    let (xpub, _) = kp.x_only_public_key();
+    Some(hex::encode(xpub.serialize()))
+}
+
+#[derive(Clone)]
+struct ProviderConsole {
+    gateway: String,
+    principal: String,
+    npub: String,
+    ahp_token: String,
+    auth_url: String,
+    ollama_base_url: String,
+    config_path: Option<String>,
+}
+
+async fn provider_home() -> axum::response::Html<&'static str> {
+    axum::response::Html(PROVIDER_HOME)
+}
+
+async fn provider_status(State(c): State<ProviderConsole>) -> Json<Value> {
+    let models = c.config_path.as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| toml::from_str::<ProviderConfig>(&t).ok())
+        .map(|cfg| cfg.models.into_iter().map(|m| {
+            json!({"name": m.name, "price_in": m.price_msat_per_mtok_in, "price_out": m.price_msat_per_mtok_out})
+        }).collect::<Vec<_>>())
+        .unwrap_or_default();
+    Json(json!({
+        "gateway": c.gateway, "principal": c.principal, "npub": c.npub,
+        "ollama": c.ollama_base_url, "models": models
+    }))
+}
+
+async fn provider_ollama_tags(State(c): State<ProviderConsole>) -> Json<Value> {
+    let url = format!("{}/api/tags", c.ollama_base_url.trim_end_matches('/'));
+    match reqwest::Client::new().get(&url).timeout(std::time::Duration::from_secs(5)).send().await {
+        Ok(r) => match r.json::<Value>().await {
+            Ok(v) => {
+                let names: Vec<String> = v.get("models").and_then(|m| m.as_array())
+                    .map(|arr| arr.iter().filter_map(|x| x.get("name").and_then(|n| n.as_str()).map(String::from)).collect())
+                    .unwrap_or_default();
+                Json(json!({"models": names}))
+            }
+            Err(_) => Json(json!({"models": [], "error": "parse"})),
+        },
+        Err(_) => Json(json!({"models": [], "error": "ollama unreachable"})),
+    }
+}
+
+async fn provider_register_nostr(State(c): State<ProviderConsole>) -> Json<Value> {
+    if c.npub.is_empty() { return Json(json!({"ok": false, "error": "no nostr key (run keygen)"})); }
+    let url = format!("{}/api/identity/nostr", c.auth_url.trim_end_matches('/'));
+    let body = json!({"token": c.ahp_token, "nostr_pubkey": c.npub});
+    match reqwest::Client::new().post(&url).json(&body).timeout(std::time::Duration::from_secs(10)).send().await {
+        Ok(r) => { let ok = r.status().is_success(); let status = r.status().as_u16(); let txt = r.text().await.unwrap_or_default(); Json(json!({"ok": ok, "status": status, "body": txt})) }
+        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct SaveModel { name: String, price_in: u64, price_out: u64 }
+
+async fn provider_save_models(State(c): State<ProviderConsole>, Json(models): Json<Vec<SaveModel>>) -> Json<Value> {
+    let Some(path) = c.config_path.clone() else { return Json(json!({"ok": false, "error": "no config path"})); };
+    let cfg = match std::fs::read_to_string(&path).ok().and_then(|t| toml::from_str::<ProviderConfig>(&t).ok()) {
+        Some(cfg) => cfg,
+        None => return Json(json!({"ok": false, "error": "cannot read existing config"})),
+    };
+    let gw_url = cfg.gateway.url.unwrap_or_else(|| c.gateway.clone());
+    let gw_id = cfg.gateway.provider_id.unwrap_or_else(|| c.principal.clone());
+    let ollama = cfg.ollama.base_url.unwrap_or_else(|| c.ollama_base_url.clone());
+    let mut out = String::new();
+    out.push_str(&format!("[gateway]\nurl = \"{}\"\nprovider_id = \"{}\"\n\n", gw_url, gw_id));
+    out.push_str(&format!("[identity]\nx25519_key_file = \"{}\"\nkeybind_file = \"{}\"\n\n", cfg.identity.x25519_key_file, cfg.identity.keybind_file));
+    out.push_str(&format!("[ollama]\nbase_url = \"{}\"\n\n", ollama));
+    for m in &models {
+        out.push_str(&format!("[[models]]\nname = \"{}\"\nollama_model = \"{}\"\ncontext_length = 8192\nprice_msat_per_mtok_in = {}\nprice_msat_per_mtok_out = {}\n\n", m.name, m.name, m.price_in, m.price_out));
+    }
+    match std::fs::write(&path, out) {
+        Ok(_) => Json(json!({"ok": true, "count": models.len()})),
+        Err(e) => Json(json!({"ok": false, "error": e.to_string()})),
+    }
+}
+
+const PROVIDER_HOME: &str = r##"<!doctype html>
+<html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Charon Provider</title>
+<style>
+:root{--bg:#0a0a0b;--surface:#131316;--border:#1f1f24;--border2:#2a2a31;--text:#eceaef;--t2:#b5b3bb;--t3:#7c7a83;--orange:#f7931a;--green:#5fb27a}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,Segoe UI,sans-serif;line-height:1.5}
+.wrap{max-width:720px;margin:0 auto;padding:34px 20px}
+h1{font-size:1.25rem;font-weight:700;letter-spacing:.05em;display:flex;align-items:center;gap:10px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 10px var(--green)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:10px;padding:20px;margin-top:18px}
+.card h2{font-size:.72rem;letter-spacing:.16em;text-transform:uppercase;color:var(--t3);margin-bottom:6px;font-family:ui-monospace,monospace}
+.mono{font-family:ui-monospace,monospace}
+.kv{display:flex;justify-content:space-between;gap:14px;font-family:ui-monospace,monospace;font-size:12.5px;padding:7px 0;border-bottom:1px solid var(--border)}
+.kv:last-child{border-bottom:0}.kv span:last-child{color:var(--orange);overflow-wrap:anywhere;text-align:right}
+input{background:#0f0f11;color:var(--text);border:1px solid var(--border2);border-radius:7px;padding:8px 10px;font-family:ui-monospace,monospace;font-size:12px}
+.btn{background:var(--orange);color:#1a1206;border:0;border-radius:7px;padding:10px 18px;font-weight:600;cursor:pointer;font-family:ui-monospace,monospace;font-size:13px}
+.btn:hover{background:#ffa733}.btn:disabled{opacity:.5;cursor:default}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.muted{color:var(--t3);font-size:12px;font-family:ui-monospace,monospace}
+</style></head>
+<body><div class="wrap">
+<h1><span class="dot"></span> CHARON &middot; provider</h1>
+<p class="muted" style="margin-top:6px">Sell your local models for bitcoin. This page is served by your running provider.</p>
+
+<div class="card">
+  <h2>Status</h2>
+  <div class="kv"><span>gateway</span><span id="gw">&hellip;</span></div>
+  <div class="kv"><span>provider id</span><span id="pid">&hellip;</span></div>
+  <div class="kv"><span>nostr npub</span><span id="npub" style="font-size:10.5px">&hellip;</span></div>
+</div>
+
+<div class="card">
+  <h2>1 &middot; Bind your Nostr key</h2>
+  <p class="muted">One-time. Binds your npub to your identity so the gateway can verify it&#39;s really you (anti-MITM). Without this, registration is rejected.</p>
+  <div class="row" style="margin-top:12px"><button class="btn" id="regBtn">Register npub</button><span class="muted" id="regMsg"></span></div>
+</div>
+
+<div class="card">
+  <h2>2 &middot; Choose models to sell</h2>
+  <p class="muted">Your local Ollama models. Check the ones to expose and set price per million tokens (msat).</p>
+  <div id="models" style="margin-top:12px"></div>
+  <div class="row" style="margin-top:12px"><button class="btn" id="saveBtn">Save</button><span class="muted" id="saveMsg"></span></div>
+  <p class="muted" style="margin-top:8px">After saving, restart the provider to apply.</p>
+</div>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+async function j(u,o){const r=await fetch(u,o);return r.json();}
+let current={};
+async function load(){
+  try{
+    const s=await j('/api/status');
+    $('gw').textContent=s.gateway||'?';$('pid').textContent=s.principal||'?';$('npub').textContent=s.npub||'(no key — run keygen)';
+    (s.models||[]).forEach(m=>{current[m.name]={in:m.price_in,out:m.price_out};});
+  }catch(e){}
+  const tags=await j('/api/ollama-tags');
+  const box=$('models');box.innerHTML='';
+  const names=(tags.models||[]);
+  if(!names.length){box.innerHTML='<div class="muted">No Ollama models found. Run <b>ollama serve</b> and <b>ollama pull &lt;model&gt;</b>, then reload.</div>';return;}
+  names.forEach(n=>{
+    const cur=current[n];
+    const row=document.createElement('div');row.className='row';row.style='margin-bottom:9px';
+    row.innerHTML='<label style="display:flex;align-items:center;gap:8px;color:var(--text);font-size:13px;min-width:210px"><input type="checkbox" class="msel" data-n="'+n+'" '+(cur?'checked':'')+'> '+n+'</label>'
+      +'<input type="number" class="pin" data-n="'+n+'" value="'+(cur?cur.in:200000)+'" title="msat / Mtok in" style="max-width:120px">'
+      +'<input type="number" class="pout" data-n="'+n+'" value="'+(cur?cur.out:600000)+'" title="msat / Mtok out" style="max-width:120px">';
+    box.appendChild(row);
+  });
+}
+$('regBtn').onclick=async()=>{
+  $('regBtn').disabled=true;$('regMsg').textContent='registering…';
+  try{const r=await j('/api/register-nostr',{method:'POST'});$('regMsg').textContent=r.ok?'bound ✓':('error: '+(r.error||r.status||''));}
+  catch(e){$('regMsg').textContent='error: '+e.message;}
+  $('regBtn').disabled=false;
+};
+$('saveBtn').onclick=async()=>{
+  const models=[];
+  document.querySelectorAll('.msel').forEach(c=>{if(c.checked){const n=c.dataset.n;const pin=document.querySelector('.pin[data-n="'+n+'"]').value;const pout=document.querySelector('.pout[data-n="'+n+'"]').value;models.push({name:n,price_in:parseInt(pin)||200000,price_out:parseInt(pout)||600000});}});
+  if(!models.length){$('saveMsg').textContent='select at least one model';return;}
+  $('saveBtn').disabled=true;$('saveMsg').textContent='saving…';
+  try{const r=await j('/api/save-models',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(models)});
+    $('saveMsg').textContent=r.ok?('saved '+r.count+' model(s) — restart the provider to apply'):('error: '+(r.error||''));}
+  catch(e){$('saveMsg').textContent='error: '+e.message;}
+  $('saveBtn').disabled=false;
+};
+load();
+</script></body></html>"##;
+
 async fn run_provider(
     config_path: Option<String>,
     ollama_override: String,
     gateway_override: String,
     ahp_token: Option<String>,
 ) -> anyhow::Result<()> {
+    let cfg_path = config_path.clone();
     let runtime = load_provider_runtime(config_path, ollama_override, gateway_override, ahp_token)?;
     tracing::info!(
         gateway = %runtime.gateway,
@@ -506,6 +688,33 @@ async fn run_provider(
     );
 
     verify_ollama_models(&runtime.ollama_base_url, &runtime.models).await;
+
+    // Local provider console (status, model picker, one-click Nostr register).
+    {
+        let console = ProviderConsole {
+            gateway: runtime.gateway.clone(),
+            principal: runtime.principal.clone(),
+            npub: provider_npub_hex().unwrap_or_default(),
+            ahp_token: runtime.ahp_token.clone(),
+            auth_url: std::env::var("GNOSIS_AUTH_URL").unwrap_or_else(|_| "https://auth.nuts.services".to_string()),
+            ollama_base_url: runtime.ollama_base_url.clone(),
+            config_path: cfg_path,
+        };
+        let port: u16 = std::env::var("CHARON_PROVIDER_CONSOLE").ok().and_then(|v| v.parse().ok()).unwrap_or(8091);
+        tokio::spawn(async move {
+            let app = Router::new()
+                .route("/", get(provider_home))
+                .route("/api/status", get(provider_status))
+                .route("/api/ollama-tags", get(provider_ollama_tags))
+                .route("/api/register-nostr", post(provider_register_nostr))
+                .route("/api/save-models", post(provider_save_models))
+                .with_state(console);
+            match tokio::net::TcpListener::bind(("127.0.0.1", port)).await {
+                Ok(listener) => { tracing::info!(port, "provider console listening"); let _ = axum::serve(listener, app).await; }
+                Err(e) => tracing::warn!(error = ?e, "provider console failed to bind"),
+            }
+        });
+    }
 
     // Auto-reconnect with backoff. Any gateway eventually drops a long-lived WS
     // (Cloud Run's 60-min request cap, restarts, transient network). Reconnecting
