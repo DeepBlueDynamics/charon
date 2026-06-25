@@ -240,6 +240,19 @@ pub struct WalletEntry {
     pub status: String,
 }
 
+// Firestore storage doc for wallet history: a flat `wallet_history` collection
+// keyed by a `principal` field (Firestore collection ids can't contain '/', so
+// a per-principal subcollection path is invalid).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct WalletHistoryDoc {
+    pub principal: String,
+    pub ts: u64,
+    #[serde(rename = "type")]
+    pub r#type: String,
+    pub amount_msat: i64,
+    pub status: String,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct UserWallet {
     pub balance_msat: u64,
@@ -613,7 +626,8 @@ impl Store for CloudStore {
                 .unwrap_or_default()
                 .as_secs();
 
-            let entry = WalletEntry {
+            let entry = WalletHistoryDoc {
+                principal: principal.to_string(),
                 ts,
                 r#type: kind.to_string(),
                 amount_msat,
@@ -623,7 +637,7 @@ impl Store for CloudStore {
             let entry_id = format!("{}_{}", ts, uuid::Uuid::new_v4());
             self.db.fluent()
                 .insert()
-                .into(format!("wallets/{}/history", principal).as_str())
+                .into("wallet_history")
                 .document_id(&entry_id)
                 .object(&entry)
                 .execute::<()>()
@@ -642,13 +656,21 @@ impl Store for CloudStore {
                 .as_secs();
             let cutoff = now.saturating_sub(14 * 24 * 60 * 60);
 
-            let list: Vec<WalletEntry> = self.db.fluent()
+            let docs: Vec<WalletHistoryDoc> = self.db.fluent()
                 .select()
-                .from(format!("wallets/{}/history", principal).as_str())
-                .filter(|q| q.field("ts").greater_than_or_equal(cutoff))
+                .from("wallet_history")
+                .filter(|q| q.field("principal").eq(principal))
                 .obj()
                 .query()
                 .await?;
+            // Single-field filter (auto-indexed); apply the 14-day cutoff in memory
+            // so we don't need a composite (principal + ts) index.
+            let mut list: Vec<WalletEntry> = docs
+                .into_iter()
+                .filter(|d| d.ts >= cutoff)
+                .map(|d| WalletEntry { ts: d.ts, r#type: d.r#type, amount_msat: d.amount_msat, status: d.status })
+                .collect();
+            list.sort_by(|a, b| b.ts.cmp(&a.ts));
             Ok(list)
         })
     }

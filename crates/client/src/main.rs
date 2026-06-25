@@ -143,21 +143,29 @@ fn run_keygen(out: String, principal: Option<String>) -> anyhow::Result<()> {
     println!("Nostr Public Key (npub): {}", bech32_npub);
     println!("Nostr Public Key (hex):  {}", hex_npub);
 
-    // Random 32-byte X25519 secret (clamped on use). Derive the public key and
-    // write the key file + a keybind the provider/consumer config points at.
-    let mut priv_bytes = [0u8; 32];
-    for chunk in priv_bytes.chunks_mut(16) {
-        chunk.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
-    }
+    // X25519 secret: reuse the existing key if present so we don't rotate the
+    // provider/consumer identity (that would break the consumer's pin and the
+    // registered npub binding); otherwise generate a fresh 32-byte key.
+    std::fs::create_dir_all(&out)?;
+    let dir = std::path::Path::new(&out);
+    let key_path = dir.join("x25519.key");
+    let kb_path = dir.join("keybind.json");
+    let priv_bytes: [u8; 32] = if key_path.exists() {
+        let pb = read_key32_file(key_path.to_str().expect("utf8 path"))?;
+        println!("Reusing existing X25519 key at {}", key_path.display());
+        pb
+    } else {
+        let mut pb = [0u8; 32];
+        for chunk in pb.chunks_mut(16) {
+            chunk.copy_from_slice(uuid::Uuid::new_v4().as_bytes());
+        }
+        pb
+    };
 
     let x25519_pub = public_from_private(&priv_bytes);
     let principal_str = principal.unwrap_or_else(|| charon_core::auth::NutsAuth::dev_principal().to_string());
     let keybind = charon_core::crypto::sign_keybind(x25519_pub, &principal_str, 0, nostr_secret);
 
-    std::fs::create_dir_all(&out)?;
-    let dir = std::path::Path::new(&out);
-    let key_path = dir.join("x25519.key");
-    let kb_path = dir.join("keybind.json");
     std::fs::write(&key_path, BASE64.encode(priv_bytes))?;
     std::fs::write(&kb_path, serde_json::to_string_pretty(&keybind)?)?;
     println!("wrote {}", key_path.display());
