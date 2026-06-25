@@ -30,7 +30,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 #[command(name = "charon", version, about = "Charon marketplace client")]
 struct Cli {
     /// Gateway WebSocket URL.
-    #[arg(long, env = "CHARON_GATEWAY", default_value = "wss://gateway.charon.nuts.services/ws")]
+    #[arg(long, env = "CHARON_GATEWAY", default_value = "wss://gateway.nuts.services/ws")]
     gateway: String,
     /// NUTS ahp_ token for this principal.
     #[arg(long, env = "NUTS_AHP_TOKEN")]
